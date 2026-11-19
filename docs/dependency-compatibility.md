@@ -16,5 +16,5 @@ the candidate lock with `npm ci` or the documented `cargo --locked` commands.
 
 To test a controlled change, dispatch the workflow with an exact npm version
 such as `react-hot-toast@2.6.0`. This replaces normal resolution for the
-application candidate only. The SDK and contract lanes still check their own
+frontend dependency resolution in the application candidate only. The SDK and contract lanes still check their own
 compatible updates. Proposed upgrades go through a separate reviewed PR.

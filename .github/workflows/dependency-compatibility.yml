@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       npm_candidate:
-        description: "Optional exact root dependency candidate (name@version)"
+        description: "Optional exact frontend dependency candidate (name@version)"
         type: string
 
 permissions:
@@ -56,12 +56,15 @@ jobs:
           if [[ $LANE == candidate ]]; then
             if [[ $PROJECT == application && -n $EXACT_CANDIDATE ]]; then
               [[ $EXACT_CANDIDATE =~ ^(@[a-z0-9._-]+/)?[a-z0-9._-]+@[0-9]+\.[0-9]+\.[0-9]+$ ]]
-              npm install --package-lock-only --ignore-scripts --save-exact "$EXACT_CANDIDATE"
+              npm install --workspace=frontend --package-lock-only --ignore-scripts --save-exact "$EXACT_CANDIDATE"
             else
               npm update --package-lock-only --ignore-scripts
             fi
           fi
           cp package.json package-lock.json "$report/"
+          if [[ $PROJECT == application ]]; then
+            cp --parents backend/package.json frontend/package.json "$report/"
+          fi
           node "$GITHUB_WORKSPACE/scripts/dependency-report.mjs" "$report/baseline-lock.json" package-lock.json > "$report/changes.md"
           head -100 "$report/changes.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Install exact dependency snapshot
@@ -72,9 +75,11 @@ jobs:
         if: matrix.project == 'application'
         working-directory: backend
         run: |
-          npx prisma db push --accept-data-loss
-          npm run build
-          npm test
+          result=0
+          npx prisma db push || result=1
+          npm run build || result=1
+          npm test || result=1
+          exit "$result"
       - name: Frontend compatibility
         if: always() && matrix.project == 'application'
         working-directory: frontend
