@@ -21,3 +21,5 @@ backend/src/generated
 !frontend/public/**
 !frontend/src/
 !frontend/src/**
+**/.env
+**/.env.*
