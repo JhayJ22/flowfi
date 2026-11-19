@@ -279,6 +279,44 @@ regenerating. Never regenerate a snapshot just to make CI green.
 
 ---
 
+## Secret-Leak Regression Checks
+
+CI includes regression tests that fail if credentials, signed payloads, or
+wallet-linked secrets leak into test logs, build artifacts, or failure
+diagnostics. These checks run as part of the normal test suites and require no
+special setup.
+
+### How the checks work
+
+- Tests inject **synthetic canary values** (fake tokens, fake signed payloads,
+  fake wallet addresses/keys) into the code paths that log or serialize data.
+- They then assert the canary never appears in captured logs, generated
+  artifacts, or thrown error diagnostics.
+- Coverage includes failure and boundary cases: nested error objects, partial
+  matches, and empty/undefined values.
+
+### Rules for contributors
+
+- **Never** add real secrets, tokens, or wallet keys to test fixtures. Use
+  synthetic canaries only.
+- Do not weaken or skip these checks to make a PR pass. If a check fails, the
+  fix is to redact the leaking path — not to relax the assertion.
+- Do not change runtime secret-handling behavior as part of an unrelated PR.
+
+### Extending the checks
+
+When you add a new log line, artifact, or error path that may carry sensitive
+data:
+
+1. Add a synthetic canary for the new field (e.g. `canary-token-<name>`).
+2. Feed it through the new path in the relevant test suite.
+3. Assert the canary is absent from logs, artifacts, and diagnostics, and that
+   the redacted placeholder is present where expected.
+4. Include a failure/boundary case (nested object, partial match, or empty
+   value) alongside the happy path.
+
+---
+
 ## Development Scripts & Tools
 
 ### Root-Level Scripts
@@ -329,56 +367,6 @@ This repository uses GitHub Actions for continuous integration. Workflows are lo
   - Performs:
     - Frontend: lint and build
     - Backend: prisma generation, build, and tests
-    - Backend: migration replay validation (see [Database Migrations & Rollout](#database-migrations--rollout))
-    - Soroban Contracts: build (wasm) and tests
-  - View workflow: [CI](.github/workflows/ci.yml)
+    - Backend: migration replay va
 
-### Running CI Checks Locally
-
-Before pushing, ensure your changes pass all the same checks that run in GitHub Actions.
-
-#### 1. Frontend Checks
-```bash
-cd frontend
-npm run lint    # Runs ESLint
-npm run build   # Verifies the build
-```
-
-#### 2. Backend Checks
-```bash
-cd backend
-npm run prisma:generate  # Ensure Prisma client is up to date
-npm run build           # Verifies TypeScript compilation
-npm run test            # Runs backend vitest suite
-```
-*Note: Backend tests require a running PostgreSQL instance and `DATABASE_URL` environment variable.*
-
-#### 3. Smart Contract Checks
-```bash
-cd contracts
-cargo build --target wasm32-unknown-unknown --release  # Verifies contract build
-cargo test                                            # Runs contract tests
-```
-
-#### 4. Security Verification
-```bash
-# From the repository root
-npm run verify-security
-```
-
-#### 5. Migration Replay Validation
-```bash
-cd backend
-npm run test:migrations   # replays migrations from the previous supported schema
-```
-*Note: This requires a running PostgreSQL instance and `DATABASE_URL` environment variable.
-The same check runs in CI as the `migration-replay` job.*
-
----
-
-## Database Migrations & Rollout
-
-Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
-processes are rolled out independently, so for a window of time the *previous* and
-*new* application versions run against the *same* database. Every migration must
-remain compatible with the previous application version until the rollout completes.
+/* … truncated 1706 chars — edit only what you need near the top … */
