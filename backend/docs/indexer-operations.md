@@ -3,10 +3,87 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the read-replica consistency and
+routing policy, and the indexer metrics. It is written for operators and
+on-call engineers. All public interfaces described here are additive; existing
+endpoints and configuration keys keep working unless noted.
+
+---
+
+## 0. Read-replica consistency and routing policy
+
+### Routing defaults
+
+API reads are routed by an explicit policy. Each read is classified as either
+**replica-eligible** or **primary-only**. The default is conservative: reads
+that are not explicitly classified as replica-eligible go to the primary.
+
+| Read class | Default route | Rationale |
+| --- | --- | --- |
+| Authorization / auth-sensitive reads (session, wallet ownership, admin checks) | **Primary** | Must never observe stale authorization state |
+| Read-after-write (a client reading data it just wrote) | **Primary** | Preserves read-your-writes for the caller |
+| Financial accounting reads (balances, ledger-derived totals) | **Primary** | Accounting invariants require the authoritative ledger |
+| Chain/network validation reads | **Primary** | Validation must see the canonical chain state |
+| Public list/history/analytics reads (streams, events, pagination) | **Replica** (when a replica is configured and caught up) | Tolerant of bounded lag; documented below |
+
+When no replica is configured, or the replica is behind the required ledger,
+replica-eligible reads transparently fall back to the primary. Callers see no
+interface change.
+
+### Freshness requirement and lag measurement
+
+The indexer cursor records the last fully applied ledger. A replica is
+considered **caught up** when its observed cursor is at or beyond the
+**required ledger** for the read:
+
+- For replica-eligible reads the required ledger is the current primary
+  cursor minus the configured tolerance (`REPLICA_MAX_LAG_LEDGERS`).
+- Reads that require the latest ledger (read-after-write, accounting,
+  authorization, validation) always require the primary cursor and are never
+  served from a replica.
+
+Lag is measured as `primaryCursor - replicaCursor` in ledgers. A replica whose
+lag exceeds the tolerance is treated as **behind**.
+
+### Informing clients when a replica is behind
+
+Replica-eligible reads that cannot be served within tolerance fall back to the
+primary, so responses stay correct. To make staleness observable without
+breaking existing clients, responses served from a replica include an additive
+header:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Read-Source` | `primary` or `replica` |
+| `X-Replica-Lag-Ledgers` | Observed lag in ledgers when served from a replica |
+
+If a caller explicitly requests replica routing (opt-in) and the replica is
+behind the required ledger, the request is served from the primary and the
+headers above reflect `primary`. Existing response bodies and status codes are
+unchanged; the headers are additive and safe to ignore.
+
+### Failover
+
+- If the replica is unreachable or errors, replica-eligible reads fail over to
+  the primary. Failover is logged and counted (see metrics).
+- If the primary is unavailable, primary-only reads fail with the existing
+  error contract; they are **never** silently served from a stale replica.
+- On replica promotion/failover, the new primary is authoritative; routing
+  policy is unchanged and lag is recomputed against the new primary cursor.
+
+### Configuration
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `REPLICA_DATABASE_URL` | Read-replica connection | Unset disables replica routing |
+| `REPLICA_MAX_LAG_LEDGERS` | Max tolerated lag for replica-eligible reads | Defaults are conservative |
+| `REPLICA_ROUTING_ENABLED` | Master switch for replica routing | Defaults to off until a replica is provisioned |
+
+### Guarantees preserved
+
+Replica routing never weakens wallet authorization, chain/network validation,
+financial accounting invariants, or secret handling: those reads are
+primary-only by policy and are not eligible for replica routing.
 
 ---
 
@@ -168,36 +245,4 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
-
----
-
-## 4. Metrics
-
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
-
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+  the lease is rejected by the same fencing check that guards cursor writes.
