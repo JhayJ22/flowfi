@@ -3,10 +3,63 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, the maintenance mode controls, and
-the indexer metrics. It is written for operators and on-call engineers. All
-public interfaces described here are additive; existing endpoints and
-configuration keys keep working unless noted.
+graceful shutdown and poll cancellation, the maintenance mode controls, the
+service dependency budget and timeout policy, and the indexer metrics. It is
+written for operators and on-call engineers. All public interfaces described
+here are additive; existing endpoints and configuration keys keep working
+unless noted.
+
+---
+
+## 0. Service dependency budgets and timeout policy
+
+### Behavior
+
+Every outbound dependency call (database, Redis, Soroban RPC, webhooks) is
+wrapped in a centralized budget policy so a slow or failing dependency cannot
+block a request or worker indefinitely. Each dependency has an explicit
+**per-attempt timeout**, a **total budget** (the wall-clock ceiling across all
+attempts including backoff), and a **bounded retry count**. When the budget is
+exhausted the call fails fast with a typed timeout error instead of hanging.
+
+- **Per-attempt timeout.** Each individual attempt is aborted when it exceeds
+  its timeout; the attempt is counted as a failure and retried if budget and
+  retry count remain.
+- **Total budget.** The sum of attempt timeouts plus backoff delays is capped
+  by the total budget. Once the budget is exhausted, no further attempts are
+  made even if the retry count has not been reached.
+- **Bounded retries.** Retries are capped per dependency; backoff is
+  exponential with jitter and is itself bounded by the remaining budget.
+- **No cascade.** A dependency that is down or slow fails within its budget,
+  so request handlers and worker loops return/continue rather than piling up
+  blocked calls.
+
+### Configuration
+
+All budgets are configurable via environment variables and have safe
+defaults. Values are in milliseconds.
+
+| Dependency | Per-attempt timeout | Total budget | Max retries |
+| --- | --- | --- | --- |
+| Database | `DB_CALL_TIMEOUT_MS` | `DB_CALL_BUDGET_MS` | `DB_CALL_MAX_RETRIES` |
+| Redis | `REDIS_CALL_TIMEOUT_MS` | `REDIS_CALL_BUDGET_MS` | `REDIS_CALL_MAX_RETRIES` |
+| Soroban RPC | `SOROBAN_RPC_TIMEOUT_MS` | `SOROBAN_RPC_BUDGET_MS` | `SOROBAN_RPC_MAX_RETRIES` |
+| Webhooks | `WEBHOOK_CALL_TIMEOUT_MS` | `WEBHOOK_CALL_BUDGET_MS` | `WEBHOOK_CALL_MAX_RETRIES` |
+
+### Impact on request and worker paths
+
+- **Request path.** API handlers that touch the database, Redis, or Soroban
+  RPC fail fast within the dependency budget and surface a timeout error
+  rather than holding the connection open. This bounds request latency and
+  prevents a single slow dependency from exhausting the request pool.
+- **Worker path.** The indexer poll loop and webhook delivery worker treat a
+  budget-exhausted call as a failed attempt: the poll is retried on the next
+  interval and webhook deliveries are retried within their own bounded budget.
+  A dependency outage therefore degrades throughput but never wedges the
+  worker.
+- **Observability.** Timeouts and budget exhaustion are logged with the
+  dependency name and attempt count, and counted in the indexer metrics so
+  on-call can distinguish a slow dependency from a hard outage.
 
 ---
 
@@ -167,150 +220,4 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the lease is rejected; replay does not bypass lease fencing.
-
----
-
-## 4. Maintenance mode
-
-Maintenance mode lets operators **pause user-facing mutations** during planned
-maintenance while keeping the service observable and recoverable. It is
-intended for short, planned windows; it is not a substitute for draining or
-scaling down the indexer.
-
-### Endpoints
-
-All maintenance endpoints live under the operator/admin surface and require
-operator authorization (the same admin credential used for replay). Requests
-without valid operator authorization are rejected with `401`/`403` and never
-change state.
-
-| Method & path | Purpose |
-| --- | --- |
-| `POST /admin/maintenance/enter` | Enter maintenance mode (pause user mutations) |
-| `POST /admin/maintenance/exit` | Exit maintenance mode (resume user mutations) |
-| `GET /admin/maintenance/status` | Read current maintenance state |
-
-`enter` and `exit` accept an optional `reason` string that is recorded for
-operator visibility. `status` is read-only and safe to poll.
-
-### Status response
-
-| Field | Description |
-| --- | --- |
-| `active` | `true` while maintenance mode is engaged |
-| `since` | Timestamp maintenance mode was entered (null when inactive) |
-| `reason` | Operator-supplied reason (null when none) |
-| `mutationsPaused` | `true` when user mutations are currently rejected |
-
-### Behavior while active
-
-- **User mutations are rejected** with `503 Service Unavailable` and a
-  machine-readable `maintenance` error code. This applies to write endpoints
-  (stream creation, cancellation, and other state-changing user operations).
-- **Read-only endpoints keep working.** Status, list, history, and analytics
-  reads continue to serve normally so operators and clients retain recovery
-  visibility.
-- **Wallet authorization and chain/network validation are unchanged.**
-  Maintenance mode does not relax any authorization, validation, or accounting
-  invariant; it only gates whether mutations are accepted.
-- **The indexer keeps its lease and cursor.** Maintenance mode does not stop
-  polling or release the lease; it only gates user mutations.
-
-### Health and readiness
-
-- **Liveness** (`/health/live`) continues to report healthy while maintenance
-  mode is active — the process is up and serving.
-- **Readiness** (`/health/ready`) reports **not ready** while maintenance mode
-  is active, so load balancers and orchestrators stop routing new traffic to
-  the instance instead of reporting false readiness. Readiness returns to
-  healthy once maintenance mode is exited.
-
-### Transition races
-
-Enter and exit are **idempotent** and safe under concurrent calls:
-
-- Repeated `enter` while already active is a no-op that returns the current
-  status (it does not reset `since`).
-- Repeated `exit` while already inactive is a no-op that returns the current
-  status.
-- Concurrent `enter`/`exit` calls are serialized so the final state matches
-  the last committed transition; callers always receive the resulting status.
-
-### Recovery
-
-To resume normal operation, call `POST /admin/maintenance/exit`. Confirm via
-`GET /admin/maintenance/status` that `active` is `false` and
-`mutationsPaused` is `false`, and that `/health/ready` reports healthy before
-restoring traffic.
-
----
-
-## 5. Soroban RPC retry and backoff
-
-### Policy
-
-Soroban RPC calls are retried on transient failures (timeouts, connection
-resets, `429`, and `5xx`) with **exponential backoff and jitter**. Non-retryable
-failures (e.g., malformed requests, `4xx` other than `429`) fail fast.
-
-- **Bounded attempts.** Each call has a maximum attempt count; after it is
-  exhausted the call fails and the error is surfaced.
-- **Exponential backoff with jitter.** Delay grows exponentially per attempt up
-  to a cap, with randomized jitter to avoid synchronized retry storms across
-  replicas.
-- **Idempotent reads.** Read calls are safe to retry. Writes are only retried
-  when the operation is idempotent by construction.
-
-### Configuration
-
-| Key | Meaning | Notes |
-| --- | --- | --- |
-| `SOROBAN_RPC_MAX_ATTEMPTS` | Maximum attempts per call | Includes the first attempt |
-| `SOROBAN_RPC_BASE_DELAY_MS` | Initial backoff delay | Grows exponentially |
-| `SOROBAN_RPC_MAX_DELAY_MS` | Backoff cap | Upper bound per attempt |
-
-### Observability
-
-Retries and exhausted attempts are logged with the call name and attempt
-number, and counted in metrics (see below).
-
----
-
-## 6. Graceful shutdown and poll cancellation
-
-### Behavior
-
-On `SIGTERM`/`SIGINT` the indexer begins a graceful shutdown:
-
-- **Stop accepting new work.** New polls are not started.
-- **Cancel in-flight polls.** The active poll is cancelled via its context;
-  partial progress is not committed past the last successfully applied
-  ledger.
-- **Release the lease.** The lease is released so another replica can take
-  over promptly rather than waiting for TTL expiry.
-- **Bounded drain.** Shutdown waits up to a configured grace period for
-  in-flight work to finish, then exits.
-
-### Configuration
-
-| Key | Meaning | Notes |
-| --- | --- | --- |
-| `INDEXER_SHUTDOWN_GRACE_MS` | Max time to drain on shutdown | Keep below orchestrator kill timeout |
-
----
-
-## 7. Metrics
-
-| Metric | Type | Description |
-| --- | --- | --- |
-| `indexer_lease_acquired_total` | counter | Lease acquisitions |
-| `indexer_lease_renewed_total` | counter | Successful renewals |
-| `indexer_lease_lost_total` | counter | Lease losses (expiry/takeover) |
-| `indexer_cursor_write_rejected_total` | counter | Fenced cursor writes rejected |
-| `indexer_poll_duration_ms` | histogram | Poll duration |
-| `indexer_rpc_retry_total` | counter | Soroban RPC retries |
-| `indexer_rpc_failure_total` | counter | Soroban RPC calls that exhausted retries |
-| `indexer_maintenance_active` | gauge | `1` while maintenance mode is active, `0` otherwise |
-| `indexer_maintenance_transitions_total` | counter | Enter/exit transitions applied |
+- **Fencing still applies.** A replay execute
