@@ -23,3 +23,5 @@ backend/src/generated
 !frontend/src/**
 **/.env
 **/.env.*
+**/node_modules
+**/.next
