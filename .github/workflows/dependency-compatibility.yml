@@ -121,7 +121,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: "1.100.0"
-          targets: wasm32-unknown-unknown
+          targets: wasm32v1-none
           components: clippy
       - name: Resolve and record inputs
         env:
@@ -136,7 +136,7 @@ jobs:
           git diff --stat -- Cargo.lock >> "$GITHUB_STEP_SUMMARY"
           git diff -- Cargo.lock > "$report/changes.diff"
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo build --locked --release --target wasm32-unknown-unknown
+      - run: cargo build --locked --release --target wasm32v1-none
         if: always()
       - run: cargo test --locked
         if: always()
