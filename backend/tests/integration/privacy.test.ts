@@ -66,19 +66,27 @@ describe.skipIf(!db.ready)('privacy retention and audit on Postgres', () => {
 
     // Break the last statement while executing the earlier deletes in the real transaction.
     const transaction = prisma.$transaction.bind(prisma);
+    let auditAttempted = false;
     const failedAudit = vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (work) => {
       if (typeof work !== 'function') throw new Error('Expected interactive transaction');
-      return transaction((tx) => work({
-        ...tx,
-        webhookDelivery: tx.webhookDelivery,
-        webhookSubscription: tx.webhookSubscription,
-        privacyReceipt: { create: () => { throw new Error('Audit unavailable'); } },
-      } as typeof tx));
+      return transaction(async (tx) => {
+        const audit = vi.spyOn(tx.privacyReceipt, 'create')
+          .mockImplementationOnce(() => {
+            auditAttempted = true;
+            throw new Error('Audit unavailable');
+          });
+        try {
+          return await work(tx);
+        } finally {
+          audit.mockRestore();
+        }
+      });
     });
     try {
       const failed = await request(app).post('/privacy/deletion').set('Authorization', authorization)
         .send({ confirm: true }).expect(503);
       expect(failed.body.status).toBe('incomplete');
+      expect(auditAttempted).toBe(true);
     } finally {
       failedAudit.mockRestore();
     }
