@@ -4,6 +4,11 @@
 # and deploys + initializes the contract on Stellar Testnet on demand (or on
 # Mainnet for release tags). The resulting contract ID is surfaced in the job
 # summary and published as a release artifact.
+#
+# Before any build or publish step, the workflow validates the requested
+# environment against the approved network, domain, and secret policy
+# (see scripts/validate-env-policy.sh). Failures are reported without ever
+# printing secret values.
 name: Deploy Soroban Contracts
 
 on:
@@ -28,15 +33,48 @@ permissions:
   contents: read
 
 jobs:
+  policy:
+    name: Validate environment policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      network: ${{ steps.policy.outputs.network }}
+      environment: ${{ steps.policy.outputs.environment }}
+    env:
+      NETWORK: ${{ inputs.network || (github.event_name == 'release' && 'mainnet' || 'testnet') }}
+      TARGET_ENVIRONMENT: ${{ github.event_name == 'release' && 'production' || 'staging' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate network, domain, and secret policy
+        id: policy
+        env:
+          # Presence-only flags: values are never echoed. The validator only
+          # checks that required secrets are configured for the environment.
+          HAS_DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET != '' }}
+          HAS_ADMIN_ADDRESS: ${{ secrets.ADMIN_ADDRESS != '' }}
+          HAS_TREASURY_ADDRESS: ${{ secrets.TREASURY_ADDRESS != '' }}
+          HAS_FEE_RATE_BPS: ${{ secrets.FEE_RATE_BPS != '' }}
+        run: |
+          set -euo pipefail
+          bash scripts/validate-env-policy.sh \
+            --network "$NETWORK" \
+            --environment "$TARGET_ENVIRONMENT"
+          echo "network=$NETWORK" >> "$GITHUB_OUTPUT"
+          echo "environment=$TARGET_ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
   deploy:
     name: Build & Deploy stream_contract
+    needs: policy
     runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'release' && 'production' || 'staging' }}
+    environment: ${{ needs.policy.outputs.environment }}
     permissions:
       contents: write
 
     env:
-      NETWORK: ${{ inputs.network || (github.event_name == 'release' && 'mainnet' || 'testnet') }}
+      NETWORK: ${{ needs.policy.outputs.network }}
 
     steps:
       - name: Checkout code
@@ -86,6 +124,56 @@ jobs:
             exit 1
           fi
           echo "WASM_WASM_PATH=$WASM" >> $GITHUB_ENV
+
+      - name: Validate Deployment Manifest
+        run: |
+          set -euo pipefail
+          WASM="$WASM_WASM_PATH"
+          MANIFEST="$MANIFEST_PATH"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "ERROR: deployment manifest not found at $MANIFEST"
+            echo "A reviewed manifest is required to promote between networks."
+            exit 1
+          fi
+
+          # Schema compatibility: manifest must declare the supported schema version.
+          SCHEMA=$(jq -r '.schemaVersion // empty' "$MANIFEST")
+          if [ "$SCHEMA" != "$MANIFEST_SCHEMA_VERSION" ]; then
+            echo "ERROR: unsupported manifest schemaVersion '$SCHEMA' (expected '$MANIFEST_SCHEMA_VERSION')"
+            exit 1
+          fi
+
+          # Network: manifest must target the network being deployed.
+          MANIFEST_NETWORK=$(jq -r '.network // empty' "$MANIFEST")
+          if [ "$MANIFEST_NETWORK" != "$NETWORK" ]; then
+            echo "ERROR: manifest network '$MANIFEST_NETWORK' does not match target network '$NETWORK'"
+            exit 1
+          fi
+
+          # Contract ID: manifest must pin a contract ID for this network.
+          CONTRACT_ID=$(jq -r --arg net "$NETWORK" '.contracts[$net].contractId // empty' "$MANIFEST")
+          if [ -z "$CONTRACT_ID" ]; then
+            echo "ERROR: manifest missing contracts.$NETWORK.contractId"
+            exit 1
+          fi
+
+          # Artifact digest: manifest digest must match the built WASM.
+          EXPECTED_DIGEST=$(jq -r --arg net "$NETWORK" '.contracts[$net].artifactDigest // empty' "$MANIFEST")
+          if [ -z "$EXPECTED_DIGEST" ]; then
+            echo "ERROR: manifest missing contracts.$NETWORK.artifactDigest"
+            exit 1
+          fi
+          ACTUAL_DIGEST="sha256:$(sha256sum "$WASM" | awk '{print $1}')"
+          if [ "$EXPECTED_DIGEST" != "$ACTUAL_DIGEST" ]; then
+            echo "ERROR: artifact digest mismatch for $NETWORK"
+            echo "  expected: $EXPECTED_DIGEST"
+            echo "  actual:   $ACTUAL_DIGEST"
+            exit 1
+          fi
+
+          echo "Manifest validated for network '$NETWORK' (contract $CONTRACT_ID)"
+          echo "MANIFEST_CONTRACT_ID=$CONTRACT_ID" >> $GITHUB_ENV
 
       - name: Generate and attach CycloneDX SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
