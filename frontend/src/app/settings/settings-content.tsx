@@ -1,22 +1,85 @@
 "use client";
 
 import { useState, useEffect, useMemo } from "react";
-import { Copy, Check, LogOut, Moon, Sun, Bell, Globe, Volume2 } from "lucide-react";
+import { Copy, Check, LogOut, Moon, Sun, Bell, Globe, Volume2, Users, UserPlus, Trash2, ShieldAlert } from "lucide-react";
 import { STELLAR_NETWORK, shortenPublicKey } from "@/lib/wallet";
 import { useWallet } from "@/context/wallet-context";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { formatNetwork } from "@/lib/wallet";
 import toast from "react-hot-toast";
+import PrivacyControls from "./privacy-controls";
 import { getApiBaseUrl } from "@/lib/api/_shared";
 import { copyToClipboard } from "@/lib/clipboard";
 import { DisconnectConfirmModal } from "@/components/wallet/DisconnectConfirmModal";
 import { useUnsavedChangesGuard } from "@/hooks/useUnsavedChangesGuard";
 import { SOUND_STORAGE_KEY } from "@/lib/transaction-feedback";
+import {
+  NOTIFICATION_EVENT_TYPES,
+  NOTIFICATION_EVENT_LABELS,
+  type NotificationEventType,
+  type NotificationPreferences,
+  loadNotificationPreferences,
+  saveNotificationPreferences,
+  getBrowserPermission,
+  requestBrowserPermission,
+  type BrowserPermission,
+} from "@/lib/notification-preferences";
 
 type DisplayCurrency = "USD" | "EUR" | "GBP" | "XLM" | "USDC";
 type AmountFormat = "full" | "compact";
 type DecimalPlaces = 2 | 4 | 7;
+
+type OrgRole = "owner" | "admin" | "member" | "viewer";
+type InvitationStatus = "pending" | "accepted" | "expired" | "revoked";
+
+interface OrgMember {
+  id: string;
+  name: string;
+  wallet: string;
+  role: OrgRole;
+}
+
+interface OrgInvitation {
+  id: string;
+  email: string;
+  role: OrgRole;
+  status: InvitationStatus;
+  invitedBy: string;
+  expiresAt: string;
+}
+
+interface OrgWorkspace {
+  id: string;
+  name: string;
+  members: OrgMember[];
+  invitations: OrgInvitation[];
+}
+
+const ROLE_LABELS: Record<OrgRole, string> = {
+  owner: "Owner",
+  admin: "Admin",
+  member: "Member",
+  viewer: "Viewer",
+};
+
+const INVITATION_STATUS_STYLES: Record<InvitationStatus, string> = {
+  pending: "bg-amber-500/20 text-amber-400 border-amber-500/30",
+  accepted: "bg-green-500/20 text-green-400 border-green-500/30",
+  expired: "bg-zinc-500/20 text-zinc-400 border-zinc-500/30",
+  revoked: "bg-red-500/20 text-red-400 border-red-500/30",
+};
+
+function canManageMembers(role: OrgRole | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+function canChangeRole(actorRole: OrgRole | undefined, targetRole: OrgRole): boolean {
+  if (!canManageMembers(actorRole)) return false;
+  // Only owners may promote/demote owners.
+  if (targetRole === "owner") return actorRole === "owner";
+  return true;
+}
 
 interface Settings {
   theme: "light" | "dark" | "system";
@@ -86,13 +149,135 @@ function persistSettings(settings: Settings): void {
 
 export default function SettingsContent() {
   const router = useRouter();
-  const { session, disconnect, isHydrated } = useWallet();
+  const { session, disconnect, isHydrated, authToken } = useWallet();
 
-  const [browserPush, setBrowserPush] = useState(false);
   const [draft, setDraft] = useState<Settings>(() => loadSavedSettings());
   const [saved, setSaved] = useState<Settings>(() => loadSavedSettings());
   const [lastLedger, setLastLedger] = useState<string>("Loading...");
   const [copied, setCopied] = useState(false);
+  const [notificationDraft, setNotificationDraft] = useState<NotificationPreferences | null>(null);
+  const [notificationSaved, setNotificationSaved] = useState<NotificationPreferences | null>(null);
+  const [permission, setPermission] = useState<BrowserPermission>("default");
+
+  const [org, setOrg] = useState<OrgWorkspace | null>(null);
+  const [orgLoading, setOrgLoading] = useState(true);
+  const [orgError, setOrgError] = useState<string | null>(null);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<OrgRole>("member");
+  const [inviteError, setInviteError] = useState<string | null>(null);
+  const [signingBlocked, setSigningBlocked] = useState<string | null>(null);
+
+  const currentMember = useMemo<OrgMember | undefined>(() => {
+    if (!org || !session?.publicKey) return undefined;
+    return org.members.find((m) => m.wallet === session.publicKey);
+  }, [org, session?.publicKey]);
+
+  const canManage = canManageMembers(currentMember?.role);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchOrg = async () => {
+      setOrgLoading(true);
+      setOrgError(null);
+      try {
+        const response = await fetch(`${INDEXER_URL}/organizations/current`);
+        if (!response.ok) {
+          throw new Error(`Request failed (${response.status})`);
+        }
+        const data = (await response.json()) as OrgWorkspace;
+        if (!cancelled) setOrg(data);
+      } catch {
+        if (!cancelled) setOrgError("Unable to load your organization workspace.");
+      } finally {
+        if (!cancelled) setOrgLoading(false);
+      }
+    };
+    fetchOrg();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const guardSigning = (actingMember: OrgMember | undefined): boolean => {
+    if (!session?.publicKey) {
+      setSigningBlocked("Connect a wallet to perform organization actions.");
+      return false;
+    }
+    if (!actingMember || actingMember.wallet !== session.publicKey) {
+      setSigningBlocked(
+        "Your connected wallet does not own this member. Signing on another wallet's behalf is not allowed."
+      );
+      return false;
+    }
+    setSigningBlocked(null);
+    return true;
+  };
+
+  const handleInvite = () => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    const email = inviteEmail.trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setInviteError("Enter a valid email address.");
+      return;
+    }
+    if (org.invitations.some((i) => i.email === email && i.status === "pending")) {
+      setInviteError("An invitation is already pending for this email.");
+      return;
+    }
+    setInviteError(null);
+    const invitation: OrgInvitation = {
+      id: `inv-${Date.now()}`,
+      email,
+      role: inviteRole,
+      status: "pending",
+      invitedBy: currentMember.name,
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    };
+    setOrg({ ...org, invitations: [invitation, ...org.invitations] });
+    setInviteEmail("");
+    toast.success("Invitation sent");
+  };
+
+  const handleRevokeInvitation = (id: string) => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    setOrg({
+      ...org,
+      invitations: org.invitations.map((i) =>
+        i.id === id ? { ...i, status: "revoked" as InvitationStatus } : i
+      ),
+    });
+    toast.success("Invitation revoked");
+  };
+
+  const handleChangeRole = (memberId: string, role: OrgRole) => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    const target = org.members.find((m) => m.id === memberId);
+    if (!target || !canChangeRole(currentMember.role, target.role)) {
+      toast.error("You do not have permission to change this role.");
+      return;
+    }
+    setOrg({
+      ...org,
+      members: org.members.map((m) => (m.id === memberId ? { ...m, role } : m)),
+    });
+    toast.success("Role updated");
+  };
+
+  const handleRemoveMember = (memberId: string) => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    const target = org.members.find((m) => m.id === memberId);
+    if (!target) return;
+    if (target.role === "owner") {
+      toast.error("The organization owner cannot be removed.");
+      return;
+    }
+    setOrg({ ...org, members: org.members.filter((m) => m.id !== memberId) });
+    toast.success("Member removed");
+  };
 
   const isDirty = useMemo(
     () =>
@@ -100,8 +285,11 @@ export default function SettingsContent() {
       draft.displayCurrency !== saved.displayCurrency ||
       draft.amountFormat !== saved.amountFormat ||
       draft.decimalPlaces !== saved.decimalPlaces ||
-      draft.transactionSounds !== saved.transactionSounds,
-    [draft, saved]
+      draft.transactionSounds !== saved.transactionSounds ||
+      (notificationDraft !== null &&
+        notificationSaved !== null &&
+        JSON.stringify(notificationDraft) !== JSON.stringify(notificationSaved)),
+    [draft, saved, notificationDraft, notificationSaved]
   );
 
   // Covers tab close/refresh, internal link navigation, and back/forward
@@ -121,6 +309,10 @@ export default function SettingsContent() {
   const handleSave = () => {
     persistSettings(draft);
     setSaved(draft);
+    if (notificationDraft && session?.publicKey) {
+      saveNotificationPreferences(session.publicKey, notificationDraft);
+      setNotificationSaved(notificationDraft);
+    }
     toast.success("Settings saved");
   };
 
@@ -149,20 +341,41 @@ export default function SettingsContent() {
     }
   };
 
-  const handleBrowserPushToggle = async () => {
-    if (!browserPush) {
-      try {
-        await Notification.requestPermission();
-        setBrowserPush(Notification.permission === "granted");
-        if (Notification.permission === "granted") {
-          toast.success("Browser notifications enabled");
-        }
-      } catch {
-        toast.error("Failed to enable notifications");
-      }
-    } else {
-      setBrowserPush(false);
-      toast("Browser notifications disabled");
+  // Load wallet-scoped notification preferences whenever the wallet changes.
+  useEffect(() => {
+    if (!session?.publicKey) {
+      setNotificationDraft(null);
+      setNotificationSaved(null);
+      return;
+    }
+    const prefs = loadNotificationPreferences(session.publicKey);
+    setNotificationDraft(prefs);
+    setNotificationSaved(prefs);
+    setPermission(getBrowserPermission());
+  }, [session?.publicKey]);
+
+  const toggleNotification = (
+    eventType: NotificationEventType,
+    channel: "inApp" | "browser"
+  ) => {
+    setNotificationDraft((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        [eventType]: { ...prev[eventType], [channel]: !prev[eventType][channel] },
+      };
+    });
+  };
+
+  const handleRequestPermission = async () => {
+    const result = await requestBrowserPermission();
+    setPermission(result);
+    if (result === "granted") {
+      toast.success("Browser notifications enabled");
+    } else if (result === "denied") {
+      toast.error("Browser notifications blocked. Update your browser settings to allow them.");
+    } else if (result === "unsupported") {
+      toast.error("Browser notifications are not supported on this device");
     }
   };
 
@@ -214,40 +427,109 @@ export default function SettingsContent() {
             </p>
           </div>
 
-          {/* Browser Push Notifications */}
-          <div className="flex items-center justify-between group">
+          {/* Notifications */}
+          <div className="space-y-4">
             <div className="flex items-center gap-3">
               <div className="p-2 rounded-lg bg-purple-500/20 text-purple-400">
                 <Bell size={18} />
               </div>
               <div>
-                <p className="font-medium text-white dark:text-black">
-                  Browser Notifications
-                </p>
+                <p className="font-medium text-white dark:text-black">Notifications</p>
                 <p className="text-sm opacity-60">
-                  Get notified about stream activity
+                  Choose which stream events notify you, per channel
                 </p>
               </div>
             </div>
 
-            <button
-              onClick={handleBrowserPushToggle}
-              aria-label="Toggle browser notifications"
-              aria-pressed={browserPush}
-              className={`relative w-14 h-7 rounded-full transition-all duration-300 ${
-                browserPush
-                  ? "bg-gradient-to-r from-purple-500 to-blue-500"
-                  : "bg-zinc-600"
-              }`}
-            >
-              <span
-                className={`absolute top-1 left-1 w-5 h-5 bg-white rounded-full shadow-md transform transition duration-300 ${
-                  browserPush
-                    ? "translate-x-7"
-                    : "translate-x-0"
-                }`}
-              />
-            </button>
+            {!session ? (
+              <p className="pl-12 text-sm opacity-60 text-white dark:text-black">
+                Connect a wallet to configure notifications. Preferences are stored per wallet.
+              </p>
+            ) : notificationDraft ? (
+              <div className="space-y-4 pl-12">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs uppercase tracking-wide text-white/50 dark:text-black/50">
+                    <span>Event</span>
+                    <span className="flex gap-6">
+                      <span>In-app</span>
+                      <span>Browser</span>
+                    </span>
+                  </div>
+                  {NOTIFICATION_EVENT_TYPES.map((eventType) => (
+                    <div
+                      key={eventType}
+                      className="flex items-center justify-between gap-4 py-1"
+                    >
+                      <span className="text-sm text-white dark:text-black">
+                        {NOTIFICATION_EVENT_LABELS[eventType]}
+                      </span>
+                      <span className="flex gap-6">
+                        <button
+                          type="button"
+                          onClick={() => toggleNotification(eventType, "inApp")}
+                          aria-label={`Toggle in-app notifications for ${NOTIFICATION_EVENT_LABELS[eventType]}`}
+                          aria-pressed={notificationDraft[eventType].inApp}
+                          className={`relative w-12 h-6 rounded-full transition-colors ${
+                            notificationDraft[eventType].inApp ? "bg-purple-600" : "bg-zinc-600"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-1 left-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                              notificationDraft[eventType].inApp ? "translate-x-6" : "translate-x-0"
+                            }`}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => toggleNotification(eventType, "browser")}
+                          aria-label={`Toggle browser notifications for ${NOTIFICATION_EVENT_LABELS[eventType]}`}
+                          aria-pressed={notificationDraft[eventType].browser}
+                          className={`relative w-12 h-6 rounded-full transition-colors ${
+                            notificationDraft[eventType].browser ? "bg-blue-600" : "bg-zinc-600"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-1 left-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                              notificationDraft[eventType].browser ? "translate-x-6" : "translate-x-0"
+                            }`}
+                          />
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 dark:border-black/10 bg-black/30 dark:bg-white/30 px-4 py-3">
+                  <div>
+                    <p className="text-sm text-white dark:text-black">Browser permission</p>
+                    <p className="text-xs opacity-60" data-testid="notification-permission-status">
+                      {permission === "granted"
+                        ? "Granted"
+                        : permission === "denied"
+                          ? "Denied — browser notifications will not be delivered"
+                          : permission === "unsupported"
+                            ? "Not supported on this device"
+                            : "Not requested yet"}
+                    </p>
+                  </div>
+                  {permission !== "granted" && permission !== "unsupported" && (
+                    <button
+                      type="button"
+                      onClick={handleRequestPermission}
+                      className="px-3 py-1.5 text-xs rounded-lg border border-purple-500/50 text-purple-300 hover:bg-purple-500/10 transition"
+                    >
+                      {permission === "denied" ? "Re-request" : "Enable"}
+                    </button>
+                  )}
+                </div>
+
+                <p className="text-xs opacity-60 text-white dark:text-black">
+                  Preferences are stored locally on this device and scoped to your connected
+                  wallet address. They are never sent to our servers. You can opt out of any
+                  event at any time; disabling a channel stops all notifications for it.
+                </p>
+              </div>
+            ) : null}
           </div>
 
           {/* Transaction Sound Effects */}
@@ -392,6 +674,185 @@ export default function SettingsContent() {
             </div>
           </div>
 
+          {/* Organization Workspace */}
+          <div className="space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-indigo-500/20 text-indigo-400">
+                <Users size={18} />
+              </div>
+              <div>
+                <p className="font-medium text-white dark:text-black">Organization Workspace</p>
+                <p className="text-sm opacity-60">Team payroll, subscriptions, and roles</p>
+              </div>
+            </div>
+
+            {signingBlocked && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300"
+              >
+                <ShieldAlert size={16} className="mt-0.5 flex-shrink-0" />
+                <span>{signingBlocked}</span>
+              </div>
+            )}
+
+            {orgLoading ? (
+              <p className="text-sm opacity-60 pl-12">Loading workspace…</p>
+            ) : orgError ? (
+              <div
+                role="alert"
+                className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300"
+              >
+                {orgError}
+              </div>
+            ) : !org ? (
+              <p className="text-sm opacity-60 pl-12">No organization workspace found.</p>
+            ) : (
+              <div className="space-y-6 pl-12">
+                <div>
+                  <p className="text-sm font-medium text-white dark:text-black">{org.name}</p>
+                  <p className="text-xs opacity-60">
+                    {currentMember
+                      ? `You are signed in as ${ROLE_LABELS[currentMember.role]}`
+                      : "Your connected wallet is not a member of this workspace"}
+                  </p>
+                </div>
+
+                {/* Members */}
+                <div className="space-y-2">
+                  <p className="text-sm text-white/60 dark:text-black/60">Members</p>
+                  {org.members.length === 0 ? (
+                    <p className="text-sm opacity-60">No members yet.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {org.members.map((member) => (
+                        <li
+                          key={member.id}
+                          className="flex items-center justify-between gap-3 rounded-xl border border-white/10 dark:border-black/10 bg-black/30 dark:bg-white/30 px-4 py-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-sm text-white dark:text-black truncate">{member.name}</p>
+                            <p className="text-xs font-mono opacity-60 truncate">{shortenPublicKey(member.wallet)}</p>
+                          </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            {canManage && member.role !== "owner" ? (
+                              <select
+                                aria-label={`Role for ${member.name}`}
+                                value={member.role}
+                                onChange={(e) => handleChangeRole(member.id, e.target.value as OrgRole)}
+                                className="px-2 py-1 rounded-lg bg-black/40 dark:bg-white/40 border border-white/10 dark:border-black/10 text-white dark:text-black text-xs"
+                              >
+                                {(["admin", "member", "viewer"] as OrgRole[]).map((r) => (
+                                  <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-xs px-2 py-1 rounded-full border border-white/10 dark:border-black/10">
+                                {ROLE_LABELS[member.role]}
+                              </span>
+                            )}
+                            {canManage && member.role !== "owner" && (
+                              <button
+                                onClick={() => handleRemoveMember(member.id)}
+                                aria-label={`Remove ${member.name}`}
+                                className="opacity-60 hover:opacity-100 transition text-red-400"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                {/* Invitations */}
+                <div className="space-y-2">
+                  <p className="text-sm text-white/60 dark:text-black/60">Invitations</p>
+                  {org.invitations.length === 0 ? (
+                    <p className="text-sm opacity-60">No invitations yet.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {org.invitations.map((inv) => (
+                        <li
+                          key={inv.id}
+                          className="flex items-center justify-between gap-3 rounded-xl border border-white/10 dark:border-black/10 px-4 py-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-sm text-white dark:text-black truncate">{inv.email}</p>
+                            <p className="text-xs opacity-60">
+                              {ROLE_LABELS[inv.role]} · invited by {inv.invitedBy}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <span className={`text-xs px-2 py-1 rounded-full border ${INVITATION_STATUS_STYLES[inv.status]}`}>
+                              {inv.status}
+                            </span>
+                            {canManage && inv.status === "pending" && (
+                              <button
+                                onClick={() => handleRevokeInvitation(inv.id)}
+                                className="text-xs text-red-400 hover:opacity-80 transition"
+                              >
+                                Revoke
+                              </button>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                {/* Invite form */}
+                {canManage ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <UserPlus size={16} className="opacity-60" />
+                      <p className="text-sm text-white/60 dark:text-black/60">Invite a teammate</p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="email"
+                        value={inviteEmail}
+                        onChange={(e) => {
+                          setInviteEmail(e.target.value);
+                          setInviteError(null);
+                        }}
+                        placeholder="teammate@example.com"
+                        aria-label="Invite email"
+                        className="flex-1 px-3 py-2 rounded-lg bg-black/40 dark:bg-white/40 border border-white/10 dark:border-black/10 text-white dark:text-black text-sm"
+                      />
+                      <select
+                        value={inviteRole}
+                        onChange={(e) => setInviteRole(e.target.value as OrgRole)}
+                        aria-label="Invite role"
+                        className="px-3 py-2 rounded-lg bg-black/40 dark:bg-white/40 border border-white/10 dark:border-black/10 text-white dark:text-black text-sm"
+                      >
+                        {(["admin", "member", "viewer"] as OrgRole[]).map((r) => (
+                          <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={handleInvite}
+                        className="px-4 py-2 text-sm rounded-xl font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition"
+                      >
+                        Invite
+                      </button>
+                    </div>
+                    {inviteError && (
+                      <p role="alert" className="text-xs text-red-400">{inviteError}</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs opacity-60">
+                    Only owners and admins can invite or manage members.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Save Changes */}
           <div className="flex items-center justify-between gap-3 rounded-2xl border border-white/10 dark:border-black/10 bg-black/30 dark:bg-white/30 px-5 py-4">
             <div>
@@ -416,6 +877,8 @@ export default function SettingsContent() {
               Save changes
             </button>
           </div>
+
+          {session && authToken && <PrivacyControls key={session.publicKey} token={authToken} />}
 
           {/* Wallet Section */}
           {session ? (
