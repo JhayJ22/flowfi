@@ -1,6 +1,17 @@
 # Development Guide
 
-## Verify a clean checkout
+## Financial UI visual baselines
+
+Run `npm run test:visual` from `frontend/` after installing Playwright Chromium
+(`npx playwright install --with-deps chromium`). The suite renders the incoming
+stream card, stream details modal, and transaction review modal with fixed data
+at 390px and 1280px widths. It fixes the clock, locale, timezone, color scheme,
+and reduced motion setting before comparing the six reviewed Linux screenshots
+in `frontend/visual/financial-summaries.spec.ts-snapshots/`. For an intentional
+change, run `npx playwright test --config playwright.visual.config.ts
+--update-snapshots`, inspect every changed image, and commit the new baselines.
+
+This guide is intended to let a new contributor run the full FlowFi stack from a fresh clone.
 
 Install Git, Bash, curl, Node.js 22.12+ with npm, Docker with a running daemon,
 and stable Rust with Cargo. Use a fresh checkout with ports 3000 and 3001 free.
