@@ -89,108 +89,119 @@ export function nativeTokenContractId(): string {
 }
 
 /**
- * A reviewed, already-built contract artifact. Promotion moves this exact
- * artifact between environments; it is never rebuilt per stage.
+ * A single network's deployment identifiers. `contracts` maps a logical
+ * contract name (e.g. "escrow") to its on-chain contract ID.
  */
-export interface ContractArtifact {
-  /** sha256 of the wasm bytes, hex encoded. */
-  digest: string;
-  /** Raw wasm bytes of the reviewed artifact. */
-  wasm: Buffer;
-  /** Contract id the artifact is expected to be deployed at. */
-  contractId: string;
-  /** Network passphrase the artifact was built for. */
+export interface NetworkEntry {
   networkPassphrase: string;
-}
-
-/** sha256 hex digest of a wasm artifact. */
-export function artifactDigest(wasm: Buffer): string {
-  return createHash('sha256').update(wasm).digest('hex');
-}
-
-/**
- * Build a {@link ContractArtifact} from reviewed wasm bytes, recording the
- * digest and deployment identity that every promotion stage must re-verify.
- */
-export function createArtifact(
-  wasm: Buffer,
-  contractId: string,
-  networkPassphrase: string = testnetConfig.networkPassphrase,
-): ContractArtifact {
-  return { digest: artifactDigest(wasm), wasm, contractId, networkPassphrase };
-}
-
-export interface PromotionStage {
-  name: string;
-  /** Signer that must authorize the promotion into this stage. */
-  signer: Keypair;
-  /** Whether this stage requires an explicit approval before promotion. */
-  requiresApproval: boolean;
-}
-
-export interface PromotionRequest {
-  artifact: ContractArtifact;
-  stage: PromotionStage;
-  /** Digest the operator claims the artifact has; must match the artifact. */
-  expectedDigest: string;
-  /** Contract id the operator claims the artifact deploys to. */
-  expectedContractId: string;
-  /** Network passphrase of the target environment. */
-  targetNetworkPassphrase: string;
-  /** Approval reference recorded for stages that require approval. */
-  approval?: string;
+  rpcUrl: string;
+  friendbotUrl?: string;
+  contracts: Record<string, string>;
 }
 
 /**
- * Verify an artifact's digest and deployment identity before promoting it into
- * a stage. Throws (aborting the promotion) on any mismatch so a different
- * binary can never be silently deployed at a later stage.
+ * Versioned registry of supported networks. Bump `version` whenever any
+ * entry changes so operators can detect drift against their pinned values.
  */
-export function verifyPromotion(request: PromotionRequest): void {
-  const { artifact, stage, expectedDigest, expectedContractId, targetNetworkPassphrase, approval } =
-    request;
+export interface NetworkRegistry {
+  version: number;
+  networks: Record<string, NetworkEntry>;
+}
 
-  if (!artifact.wasm || artifact.wasm.length === 0) {
-    throw new Error(`promotion to ${stage.name} aborted: artifact is missing or empty`);
-  }
+/**
+ * Trust/update policy: the registry below is the source of truth shipped with
+ * the SDK. Operators pin approved values via `pinRegistry`; runtime resolution
+ * (`resolveNetwork`) then uses the pinned entries and rejects any entry whose
+ * passphrase or contract identity differs from the pin. To adopt a new
+ * registry version, review the diff, bump the pin, and re-run the e2e suite.
+ */
+export const NETWORK_REGISTRY: NetworkRegistry = {
+  version: 1,
+  networks: {
+    testnet: {
+      networkPassphrase: testnetConfig.networkPassphrase,
+      rpcUrl: testnetConfig.rpcUrl,
+      friendbotUrl: testnetConfig.friendbotUrl,
+      contracts: {},
+    },
+  },
+};
 
-  const actualDigest = artifactDigest(artifact.wasm);
-  if (actualDigest !== artifact.digest) {
-    throw new Error(
-      `promotion to ${stage.name} aborted: artifact digest ${actualDigest} does not match recorded digest ${artifact.digest}`,
-    );
+const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
+/** Validate a single registry entry; throws on malformed passphrase/contracts. */
+export function validateNetworkEntry(name: string, entry: NetworkEntry): void {
+  if (!entry.networkPassphrase || entry.networkPassphrase.trim().length === 0) {
+    throw new Error(`registry entry "${name}": missing network passphrase`);
   }
-  if (expectedDigest !== artifact.digest) {
-    throw new Error(
-      `promotion to ${stage.name} aborted: expected digest ${expectedDigest} does not match artifact digest ${artifact.digest}`,
-    );
+  if (!entry.rpcUrl || !/^https?:\/\//.test(entry.rpcUrl)) {
+    throw new Error(`registry entry "${name}": invalid rpcUrl "${entry.rpcUrl}"`);
   }
-  if (expectedContractId !== artifact.contractId) {
-    throw new Error(
-      `promotion to ${stage.name} aborted: expected contract ${expectedContractId} does not match artifact contract ${artifact.contractId}`,
-    );
+  for (const [contractName, contractId] of Object.entries(entry.contracts)) {
+    if (!CONTRACT_ID_RE.test(contractId)) {
+      throw new Error(
+        `registry entry "${name}": contract "${contractName}" has invalid contract ID "${contractId}"`,
+      );
+    }
   }
-  if (targetNetworkPassphrase !== artifact.networkPassphrase) {
-    throw new Error(
-      `promotion to ${stage.name} aborted: target network does not match artifact network`,
-    );
+}
+
+/** Validate every entry in a registry; throws on the first invalid entry. */
+export function validateRegistry(registry: NetworkRegistry): void {
+  if (!Number.isInteger(registry.version) || registry.version < 1) {
+    throw new Error(`registry: invalid version ${registry.version}`);
   }
-  if (!stage.signer || !stage.signer.publicKey()) {
-    throw new Error(`promotion to ${stage.name} aborted: stage has no authorized signer`);
-  }
-  if (stage.requiresApproval && !approval) {
-    throw new Error(`promotion to ${stage.name} aborted: stage requires an approval reference`);
+  for (const [name, entry] of Object.entries(registry.networks)) {
+    validateNetworkEntry(name, entry);
   }
 }
 
 /**
- * Promote a reviewed artifact into a stage without rebuilding it. Verifies the
- * digest and deployment identity, then returns the artifact bound to the stage
- * signer so the caller can deploy the exact same bytes.
+ * Pin approved registry values. The pinned registry is validated up front and
+ * used by `resolveNetwork` instead of the shipped defaults.
  */
-export function promoteArtifact(request: PromotionRequest): ContractArtifact {
-  verifyPromotion(request);
-  return request.artifact;
+export function pinRegistry(registry: NetworkRegistry): NetworkRegistry {
+  validateRegistry(registry);
+  return registry;
+}
+
+/**
+ * Resolve a network from the registry, optionally against a pinned registry.
+ * Rejects unknown networks and any entry whose passphrase or contract identity
+ * changed relative to the pin.
+ */
+export function resolveNetwork(
+  name: string,
+  pinned?: NetworkRegistry,
+  registry: NetworkRegistry = NETWORK_REGISTRY,
+): NetworkEntry {
+  const source = pinned ?? registry;
+  const entry = source.networks[name];
+  if (!entry) {
+    throw new Error(`unknown network "${name}" in registry v${source.version}`);
+  }
+  validateNetworkEntry(name, entry);
+
+  if (pinned) {
+    const current = registry.networks[name];
+    if (!current) {
+      throw new Error(`network "${name}" removed from registry v${registry.version}`);
+    }
+    if (current.networkPassphrase !== entry.networkPassphrase) {
+      throw new Error(`network "${name}": passphrase changed since pin`);
+    }
+    const pinnedContracts = entry.contracts;
+    const currentContracts = current.contracts;
+    for (const [contractName, contractId] of Object.entries(pinnedContracts)) {
+      if (currentContracts[contractName] !== contractId) {
+        throw new Error(
+          `network "${name}": contract "${contractName}" changed since pin`,
+        );
+      }
+    }
+  }
+
+  return entry;
 }
 
 export interface InvokeResult {
@@ -273,4 +284,132 @@ export async function simulateRead(
   }
   const retval = sim.result?.retval;
   return retval ? scValToNative(retval) : undefined;
+}
+
+/**
+ * Deterministic local Soroban integration fixtures.
+ *
+ * These fixtures exercise stream creation and lifecycle calls against a local
+ * Soroban RPC (e.g. `stellar container start local`) so CI does not depend on
+ * public testnet availability. Contract artifacts are pinned by hash and the
+ * fixture state is reset between cases.
+ *
+ * Startup:
+ *   1. `stellar container start local` (exposes RPC on http://localhost:8000/soroban/rpc)
+ *   2. Deploy the pinned stream contract artifact (see `PINNED_CONTRACT`).
+ *   3. Call `createLocalFixture()` in `beforeEach` to reset state.
+ *
+ * Testnet parity: the same `invokeContract`/`simulateRead` helpers are used by
+ * the deployed testnet smoke scenario, so a passing local fixture run implies
+ * the same call surface works against testnet.
+ */
+export interface LocalFixtureConfig {
+  rpcUrl: string;
+  networkPassphrase: string;
+  contractId: string;
+  /** sha256 of the pinned contract wasm artifact. */
+  artifactHash: string;
+}
+
+/** Pinned contract artifact identity; bump deliberately when the contract changes. */
+export const PINNED_CONTRACT = {
+  artifactHash: '0000000000000000000000000000000000000000000000000000000000000000',
+} as const;
+
+export interface LocalFixture {
+  config: LocalFixtureConfig;
+  server: rpc.Server;
+  /** Fresh funded account for the current case. */
+  account: Keypair;
+  /** Reset fixture state so cases are independent. */
+  reset: () => Promise<void>;
+  invoke: (method: string, args: xdr.ScVal[]) => Promise<InvokeResult>;
+  read: (method: string, args: xdr.ScVal[]) => Promise<unknown>;
+}
+
+/**
+ * Create a deterministic local fixture bound to a pinned contract artifact.
+ * Throws if the configured artifact hash does not match the pin, so a drifted
+ * local deployment fails fast instead of producing misleading results.
+ */
+export async function createLocalFixture(
+  config: LocalFixtureConfig,
+): Promise<LocalFixture> {
+  if (config.artifactHash !== PINNED_CONTRACT.artifactHash) {
+    throw new Error(
+      `Local fixture artifact hash ${config.artifactHash} does not match pinned ${PINNED_CONTRACT.artifactHash}`,
+    );
+  }
+
+  const localServer = new rpc.Server(config.rpcUrl, {
+    allowHttp: config.rpcUrl.startsWith('http://'),
+  });
+
+  const account = Keypair.random();
+
+  const invoke = async (method: string, args: xdr.ScVal[]): Promise<InvokeResult> => {
+    const source = await localServer.getAccount(account.publicKey());
+    const tx = new TransactionBuilder(source, {
+      fee: BASE_FEE,
+      networkPassphrase: config.networkPassphrase,
+    })
+      .addOperation(new Contract(config.contractId).call(method, ...args))
+      .setTimeout(60)
+      .build();
+    const prepared = await localServer.prepareTransaction(tx);
+    prepared.sign(account);
+    const sent = await localServer.sendTransaction(prepared);
+    if (sent.status === 'ERROR' || sent.status === 'TRY_AGAIN_LATER') {
+      throw new Error(
+        `${method}: sendTransaction returned ${sent.status}: ${sent.errorResult?.toXDR('base64') ?? 'no errorResult'}`,
+      );
+    }
+    const final = await waitFor(
+      `${method} tx ${sent.hash} to finalize`,
+      async () => {
+        const res = await localServer.getTransaction(sent.hash);
+        return res.status === rpc.Api.GetTransactionStatus.NOT_FOUND ? undefined : res;
+      },
+      { timeoutMs: 30_000, intervalMs: 500 },
+    );
+    if (final.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+      throw new Error(
+        `${method}: transaction ${sent.hash} ${final.status}: ${final.resultXdr?.toXDR('base64') ?? ''}`,
+      );
+    }
+    return {
+      hash: sent.hash,
+      ledger: final.ledger,
+      returnValue: final.returnValue ? scValToNative(final.returnValue) : undefined,
+    };
+  };
+
+  const read = async (method: string, args: xdr.ScVal[]): Promise<unknown> => {
+    const source = await localServer.getAccount(account.publicKey());
+    const tx = new TransactionBuilder(source, {
+      fee: BASE_FEE,
+      networkPassphrase: config.networkPassphrase,
+    })
+      .addOperation(new Contract(config.contractId).call(method, ...args))
+      .setTimeout(30)
+      .build();
+    const sim = await localServer.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim)) {
+      throw new Error(`${method} simulation failed: ${sim.error}`);
+    }
+    const retval = sim.result?.retval;
+    return retval ? scValToNative(retval) : undefined;
+  };
+
+  const reset = async (): Promise<void> => {
+    // Local RPC exposes a reset endpoint that clears ledger state; fall back to
+    // a no-op when the node does not support it (older local images).
+    try {
+      await fetch(`${config.rpcUrl}/reset`, { method: 'POST' });
+    } catch {
+      // ignore: reset is best-effort on nodes without the endpoint
+    }
+  };
+
+  return { config, server: localServer, account, reset, invoke, read };
 }

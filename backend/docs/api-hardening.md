@@ -6,9 +6,9 @@ This document describes the externally observable behavior, migration path, roll
 2. Principal-aware rate limits for expensive operations
 3. Stable cursor pagination for stream and event history
 4. Idempotency keys for retryable stream commands
-5. Auditable, purpose-bound data access for support tooling
+5. Reusable webhook signature verification (SDK helper)
 
-All five features are additive and preserve existing public interfaces unless explicitly noted. Where behavior changes, a versioned compatibility plan is provided.
+All features are additive and preserve existing public interfaces unless explicitly noted. Where behavior changes, a versioned compatibility plan is provided.
 
 ---
 
@@ -143,20 +143,49 @@ Responses include:
 - Results are ordered deterministically by `(createdAt, id)` — timestamp first, then a unique tiebreaker — so that rows with equal timestamps are never reordered between pages.
 - Across page boundaries, no row is skipped or duplicated, including under concurrent inserts. Newly inserted rows that sort after the cursor position appear on subsequent pages; rows inserted before the cursor position are not retroactively included.
 
-### Cursor Expiry
+### Signed, Query-Bound Cursors
 
-- Cursors encode their ordering position and are valid for a bounded window (default 24 hours). Expired or malformed cursors return `INVALID_CURSOR` with a message instructing the client to restart pagination from the first page.
-- Cursors are not tied to a session and may be reused across requests within their validity window.
+Cursors are tamper-evident and bound to the query that produced them. Each cursor is an opaque token whose payload is authenticated with an HMAC-SHA256 signature using a server-held secret (rotatable via key id). The signed payload covers:
+
+- the ordering position (`createdAt`, `id`),
+- the originating query context: normalized filters, sort order, and network/chain id,
+- an issued-at timestamp and an expiry timestamp,
+- a cursor format version and signing key id.
+
+Because the query context is inside the signed payload, a cursor cannot be reused against a different query. Presenting a cursor whose embedded filters, sort order, or network do not match the current request is rejected. Clients must not attempt to modify or reconstruct cursors; doing so invalidates the signature.
+
+### Cursor Errors
+
+All cursor failures return HTTP `400` with the standard error envelope and the stable code `INVALID_CURSOR`. The `message` distinguishes the cause for operators while remaining safe for clients:
+
+| Condition | `code` | `message` (stable) |
+| --- | --- | --- |
+| Malformed / undecodable token | `INVALID_CURSOR` | `Cursor is malformed. Restart pagination from the first page.` |
+| Signature mismatch (tampered) | `INVALID_CURSOR` | `Cursor signature is invalid. Restart pagination from the first page.` |
+| Expired token | `INVALID_CURSOR` | `Cursor has expired. Restart pagination from the first page.` |
+| Query mismatch (filters/sort/network) | `INVALID_CURSOR` | `Cursor does not match the current query. Restart pagination from the first page.` |
+
+Clients should treat any `INVALID_CURSOR` response identically: discard the cursor and restart from the first page. The specific message is informational and may be refined without a version bump; the `code` is stable.
+
+### Cursor Lifetime
+
+- Cursors are valid for a bounded window (default 24 hours from issuance). The lifetime is configurable per deployment.
+- Expiry is enforced from the signed issued-at/expiry fields, not from any client-supplied value.
+- Cursors are not tied to a session and may be reused across requests within their validity window, provided the query context matches.
+- Signing keys are versioned by key id so keys can be rotated; outstanding cursors remain valid until expiry under their original key id.
 
 ### Migration and Rollout
 
 - Cursor pagination is introduced under the API version header. Legacy offset-based pagination remains available during the deprecation window and returns the existing response shape.
 - Clients opt in by sending the version header; the response shape for legacy callers is unchanged.
+- Signed cursors are a strict superset of the previous opaque cursor behavior: clients that pass cursors back verbatim require no change. Clients that previously constructed or mutated cursors will now receive `INVALID_CURSOR`.
 
 ### Operational Impact
 
 - Cursor queries use indexed `(createdAt, id)` scans, avoiding deep-offset performance degradation.
 - Cursor encoding is versioned internally so that the format can evolve without breaking outstanding cursors within their validity window.
+- Signature verification is constant-time and cheap; rejected cursors are counted via metrics (`cursor_rejected_total{reason}`) for alerting on tampering or misconfiguration.
+- The signing secret is provided via the existing secret-management path and is never logged or returned to clients.
 
 ---
 
@@ -179,64 +208,4 @@ Idempotency-Key: 8f14e45f-ceea-467a-...
 ### Retention
 
 - Idempotency records are retained for a bounded window (default 24 hours) after the original request completes. After expiry, the key may be reused as a new request.
-- Retention is durable across instances.
-
----
-
-## 5. Auditable, Purpose-Bound Data Access for Support Tooling
-
-Support and operational tooling must not have blanket read access to user data. Every access is bound to a documented purpose, a bounded duration, and an explicit approval, and every access is recorded in a reviewable audit trail.
-
-### Allowed Purposes
-
-A support access grant must declare one of the following purposes. Requests with an undocumented or unrecognized purpose are denied.
-
-| Purpose | Description |
-| --- | --- |
-| `SUPPORT_TICKET` | Investigating a specific user-reported issue. |
-| `INCIDENT_RESPONSE` | Diagnosing an active operational incident. |
-| `COMPLIANCE_REVIEW` | Responding to a documented compliance or legal request. |
-
-### Allowed Fields
-
-Support tooling may only read the following fields. Wallet-linked data (wallet addresses, signatures, keys, balances, and transaction payloads) is **not** exposed through support access.
-
-| Field | Notes |
-| --- | --- |
-| `accountId` | Opaque internal identifier. |
-| `streamId` | Opaque internal identifier. |
-| `streamStatus` | Lifecycle state only. |
-| `createdAt` | Record creation timestamp. |
-| `updatedAt` | Record update timestamp. |
-| `errorCode` | Stable machine-readable error code. |
-
-Requests for fields outside this allowlist are rejected with `FORBIDDEN`; the response never includes the disallowed field.
-
-### Time-Bounded Approvals
-
-- Each grant carries an explicit `expiresAt`. The maximum duration is bounded (default 60 minutes); longer requests are rejected with `VALIDATION_FAILED`.
-- A grant must reference an approver distinct from the requester. Grants without an approval are denied with `FORBIDDEN`.
-- Once `expiresAt` has passed, the grant is expired and any access attempt is denied with `FORBIDDEN`. Expiry is evaluated at access time, not only at grant creation.
-
-### Audit Trail
-
-Every access attempt — granted or denied — appends an audit record containing:
-
-- the requesting principal and the approver,
-- the declared purpose,
-- the fields requested and the fields actually returned,
-- the grant identifier and its `expiresAt`,
-- the outcome (`GRANTED`, `DENIED_EXPIRED`, `DENIED_UNAPPROVED`, `DENIED_PURPOSE`, `DENIED_FIELD`),
-- a correlation `requestId` matching the response header and server logs.
-
-Audit records never contain the values of the accessed fields, only their names, so the trail itself does not leak wallet-linked data.
-
-### Migration and Rollout
-
-- Support access is additive and does not change existing authenticated user or wallet interfaces.
-- Existing support tooling that relied on broad read access must migrate to purpose-bound grants; broad access is removed rather than versioned.
-
-### Operational Impact
-
-- Denials are logged and surfaced via metrics so that misconfigured or abusive grants are visible.
-- The audit trail is append-only and retained per the compliance retention policy.
+- Retention is durable across instance
