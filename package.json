@@ -13,7 +13,7 @@
     "verify-security": "node scripts/verify-security-setup.js"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^5.0.5",
+    "@vitest/coverage-v8": "^5.1.1",
     "husky": "^9.1.7",
     "lint-staged": "^17.6.1",
     "next": "16.4.6",
