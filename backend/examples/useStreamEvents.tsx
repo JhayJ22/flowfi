@@ -24,6 +24,7 @@ interface StreamEvent {
   type: StreamEventEnvelope['type'];
   data: any;
   timestamp: number;
+  schemaVersion?: string;
 }
 
 interface UseStreamEventsOptions {

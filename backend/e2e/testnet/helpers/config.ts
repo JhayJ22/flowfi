@@ -301,3 +301,17 @@ export function preflight(
 
   return { ok: errors.length === 0, errors };
 }
+
+/** True when the local fixture is configured with a deployed contract id. */
+export function hasLocalContract(): boolean {
+  return localFixtureConfig.contractId.length > 0;
+}
+
+/**
+ * Selects the active fixture config. Defaults to the public testnet config so
+ * existing suites keep their behavior; set `E2E_FIXTURE=local` to run against
+ * the deterministic local fixture instead.
+ */
+export function activeFixtureConfig() {
+  return process.env.E2E_FIXTURE === 'local' ? localFixtureConfig : testnetConfig;
+}
