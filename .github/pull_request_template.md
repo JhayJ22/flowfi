@@ -15,11 +15,51 @@
 ## Related Issues
 <!-- Link related issues using keywords like "Closes", "Fixes", "Resolves" -->
 <!-- Example: Closes #123, Fixes #456 -->
+<!-- REQUIRED: every PR must reference at least one issue. The CI policy check
+     (scripts/ci/issue-linked-change-policy.mjs) fails the build when no issue
+     link is found. -->
 
 Closes #
 
+## Task Ownership
+<!-- Complete when this PR delivers substantial or multi-part work -->
+<!-- See the advanced task ownership and review workflow in CONTRIBUTING.md -->
+
+- [ ] This PR is linked to the issue that owns the work (no untracked scope)
+- [ ] Dependent work is split into tracked sub-issues and linked above
+- [ ] Scope boundaries are stated in the Description (what is in and out of scope)
+- [ ] Design review requested before implementation if the change alters public interfaces, contracts, or data models
+
 ## Changes Made
 <!-- Describe the specific changes made in this PR -->
+
+## Policy Evidence
+<!-- REQUIRED when this PR touches financial behavior, public API contracts,
+     or operational controls. The CI policy check inspects the diff and fails
+     unless the matching evidence below is present. -->
+
+### Does this PR touch a governed area?
+<!-- Mark all that apply. Leave all unchecked if none apply. -->
+
+- [ ] Financial behavior (accounting invariants, balances, payouts, fees)
+- [ ] Public API contracts (routes, request/response shapes, versioning)
+- [ ] Operational controls (CI, deploy, secrets handling, alerting, runbooks)
+
+### Evidence for governed changes
+<!-- Complete the rows that match the boxes checked above. -->
+
+- **Focused tests:** <!-- Link the test file(s) and name the failure/boundary cases covered -->
+- **Owning documentation:** <!-- Link the API/contract/operational/contributor doc updated in this PR -->
+- **Interface compatibility:** <!-- Confirm existing interfaces stay compatible, or link the versioning change -->
+
+### Exemption
+<!-- Maintainers may exempt a governed change only with an explicit, reviewable
+     reason. Exemptions are never silent: the CI check requires the marker below
+     and a justification. -->
+
+- [ ] This PR is exempt from the policy evidence requirement
+
+**Exemption justification:** <!-- Required if the box above is checked -->
 
 ## Testing
 <!-- Describe the tests you ran and how to verify your changes -->
@@ -34,6 +74,16 @@ Closes #
 1. 
 2. 
 3. 
+
+## Evidence for Sensitive Changes
+<!-- Complete when this PR touches financial accounting, wallet authorization, chain/network validation, or secret handling -->
+<!-- See the evidence requirements in CONTRIBUTING.md -->
+
+- [ ] Not a financial or security-sensitive change (skip the rest of this section)
+- [ ] Tests cover the relevant failure and boundary cases (not only the happy path)
+- [ ] Invariant checks documented (e.g. accounting balances, authorization denials, network validation)
+- [ ] Audit notes included describing the risk considered and why the change is safe
+- [ ] No wallet authorization, chain/network validation, accounting invariants, or secret-handling requirements were weakened
 
 ## Breaking Changes
 <!-- If this PR includes breaking changes, describe them here -->

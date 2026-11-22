@@ -3,7 +3,7 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { xdr, Keypair, TransactionBuilder, Networks } from "@stellar/stellar-sdk";
+import { xdr, Account, Keypair, TransactionBuilder, Networks } from "@stellar/stellar-sdk";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CERT_DIR = path.join(__dirname, "..", ".e2e-certs");
@@ -24,7 +24,221 @@ const WITHDRAW_BATCH = BigInt("100000000"); // 10 USDC per simulated withdrawal
 
 const accountSequence = ["1"];
 
+// ── Recurring payment schedule fixtures ──────────────────────────────────────
+// Each schedule generates one stream (payment obligation) per run. The mock
+// keeps a small deterministic set of schedules covering the happy path plus the
+// failure states the e2e suite must exercise: missed run, insufficient funds,
+// cancellation, and wallet/network mismatch.
+
+const SCHEDULE_INTERVAL_SECONDS = 86400; // daily
+const SCHEDULE_FUNDING_AMOUNT = "500000000"; // 50 USDC per run (7 decimals)
+const SCHEDULE_FUNDING_FEE = "100000"; // 0.01 USDC network fee estimate
+
+function createSchedule(overrides = {}) {
+  const base = {
+    id: "sched-1",
+    owner: SESSION_PUBLIC_KEY,
+    recipient: RECIPIENT_PUBLIC_KEY,
+    tokenAddress: USDC_ADDRESS,
+    amountPerRun: SCHEDULE_FUNDING_AMOUNT,
+    intervalSeconds: SCHEDULE_INTERVAL_SECONDS,
+    networkPassphrase: Networks.TESTNET,
+    status: "active",
+    nextRunAt: nowSec() + SCHEDULE_INTERVAL_SECONDS,
+    lastRunAt: nowSec() - SCHEDULE_INTERVAL_SECONDS,
+    runCount: 1,
+    missedRuns: 0,
+    availableBalance: "10000000000", // 1,000 USDC
+    createdAt: new Date(Date.now() - 2 * SCHEDULE_INTERVAL_SECONDS * 1000).toISOString(),
+    updatedAt: new Date().toISOString(),
+    streams: [
+      {
+        id: "42",
+        streamId: 42,
+        runIndex: 0,
+        status: "active",
+        amount: SCHEDULE_FUNDING_AMOUNT,
+        createdAt: new Date(Date.now() - SCHEDULE_INTERVAL_SECONDS * 1000).toISOString(),
+      },
+    ],
+  };
+  return { ...base, ...overrides };
+}
+
+let schedules = [
+  createSchedule(),
+  createSchedule({
+    id: "sched-missed",
+    status: "active",
+    nextRunAt: nowSec() - 7200,
+    lastRunAt: nowSec() - SCHEDULE_INTERVAL_SECONDS - 7200,
+    missedRuns: 1,
+    streams: [],
+  }),
+  createSchedule({
+    id: "sched-insufficient",
+    status: "active",
+    availableBalance: "10000000", // 1 USDC — below the 50 USDC run cost
+    streams: [],
+  }),
+  createSchedule({
+    id: "sched-cancelled",
+    status: "cancelled",
+    nextRunAt: null,
+    streams: [],
+  }),
+  createSchedule({
+    id: "sched-network-mismatch",
+    status: "active",
+    networkPassphrase: Networks.PUBLIC,
+    streams: [],
+  }),
+];
+
+function findSchedule(id) {
+  return schedules.find((s) => s.id === id) ?? null;
+}
+
+function scheduleFundingPreview(schedule) {
+  const amount = BigInt(schedule.amountPerRun);
+  const fee = BigInt(SCHEDULE_FUNDING_FEE);
+  const available = BigInt(schedule.availableBalance);
+  const required = amount + fee;
+  return {
+    scheduleId: schedule.id,
+    amountPerRun: schedule.amountPerRun,
+    estimatedFee: SCHEDULE_FUNDING_FEE,
+    totalRequired: required.toString(),
+    availableBalance: schedule.availableBalance,
+    sufficientFunds: available >= required,
+    nextRunAt: schedule.nextRunAt,
+    missedRuns: schedule.missedRuns,
+    networkPassphrase: schedule.networkPassphrase,
+    expectedNetworkPassphrase: Networks.TESTNET,
+    networkMatches: schedule.networkPassphrase === Networks.TESTNET,
+  };
+}
+
 const nowSec = () => Math.floor(Date.now() / 1000);
+
+// ── Token metadata fixtures ──────────────────────────────────────────────────
+// Each token carries provenance, verification state and network-specific
+// addresses so the token-selection UI can be exercised end to end.
+
+const NETWORK = process.env.E2E_NETWORK || "testnet";
+
+const TOKEN_FIXTURES = {
+  [USDC_ADDRESS]: {
+    address: USDC_ADDRESS,
+    symbol: "USDC",
+    name: "USD Coin",
+    decimals: 7,
+    provenance: "configured",
+    verification: "verified",
+    verified: true,
+    deprecated: false,
+    blocked: false,
+    issuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    contractId: USDC_ADDRESS,
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: USDC_ADDRESS,
+      testnet: USDC_ADDRESS,
+      mainnet: "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+    },
+  },
+  // Deprecated but still selectable (with a warning).
+  CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA: {
+    address: "CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    symbol: "OLD",
+    name: "Legacy Token",
+    decimals: 7,
+    provenance: "configured",
+    verification: "deprecated",
+    verified: true,
+    deprecated: true,
+    blocked: false,
+    issuer: null,
+    contractId: "CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: "CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    },
+  },
+  // Unverified asset discovered on-chain but not in the configured allowlist.
+  CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB: {
+    address: "CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    symbol: "UNV",
+    name: "Unverified Token",
+    decimals: 7,
+    provenance: "discovered",
+    verification: "unverified",
+    verified: false,
+    deprecated: false,
+    blocked: false,
+    issuer: null,
+    contractId: "CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: "CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    },
+  },
+  // Blocked asset: must never be selectable, but raw identifiers stay visible.
+  CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC: {
+    address: "CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    symbol: "BLK",
+    name: "Blocked Token",
+    decimals: 7,
+    provenance: "configured",
+    verification: "blocked",
+    verified: false,
+    deprecated: false,
+    blocked: true,
+    blockedReason: "Asset is on the operator blocklist",
+    issuer: null,
+    contractId: "CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: "CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    },
+  },
+};
+
+// Token whose metadata cannot be resolved: the API returns the raw address
+// with null metadata fields so the UI can fall back without hiding identifiers.
+const UNKNOWN_METADATA_ADDRESS =
+  "CDDDDDDDUNKNOWNMETADATATOKENDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+
+function unknownMetadataToken(address) {
+  return {
+    address,
+    symbol: null,
+    name: null,
+    decimals: null,
+    provenance: "unknown",
+    verification: "unknown",
+    verified: false,
+    deprecated: false,
+    blocked: false,
+    issuer: null,
+    contractId: address,
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: { [NETWORK]: address },
+    metadataError: "metadata unavailable",
+  };
+}
+
+function lookupToken(address) {
+  if (!address) return null;
+  if (TOKEN_FIXTURES[address]) return TOKEN_FIXTURES[address];
+  if (address === UNKNOWN_METADATA_ADDRESS) return unknownMetadataToken(address);
+  return unknownMetadataToken(address);
+}
 
 function createStream() {
   return {
@@ -98,13 +312,14 @@ function accountEntryXdr(publicKey, seq) {
   const accountEntry = new xdr.AccountEntry({
     accountId: kp.xdrAccountId(),
     balance: xdr.Int64.fromString("0"),
-    seqNum: new xdr.SequenceNumber(xdr.Int64.fromString(String(seq))),
+    seqNum: xdr.Int64.fromString(String(seq)),
     numSubEntries: 0,
+    inflationDest: null,
     flags: 0,
     homeDomain: "",
     thresholds: new Uint8Array(4),
     signers: [],
-    ext: new xdr.AccountEntryExt(0),
+    ext: xdr.AccountEntryExt.v0(),
   });
   return xdr.LedgerEntryData.account(accountEntry);
 }
@@ -124,8 +339,8 @@ function sorobanTransactionDataBase64() {
   });
   const data = new xdr.SorobanTransactionData({
     resources,
-    resourceFee: 0n,
-    ext: new xdr.SorobanTransactionDataExt(0),
+    resourceFee: xdr.Int64.fromString("0"),
+    ext: xdr.SorobanTransactionDataExt.v0(),
   });
   return data.toXDR("base64");
 }
@@ -177,6 +392,52 @@ function handleRest(req, res) {
     return sendJson(res, 200, { data: [stream] });
   }
 
+  // Token list used by the token-selection UI. Includes configured, verified,
+  // deprecated, unverified and blocked assets plus provenance/network data.
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/v1/tokens" || url.pathname === "/api/v1/tokens")
+  ) {
+    const tokens = Object.values(TOKEN_FIXTURES);
+    return sendJson(res, 200, { data: tokens, network: NETWORK });
+  }
+
+  const tokenDetail = url.pathname.match(/^\/v1\/tokens\/([^/]+)$/);
+  if (req.method === "GET" && tokenDetail) {
+    const address = decodeURIComponent(tokenDetail[1]);
+    const token = lookupToken(address);
+    if (!token) {
+      return sendJson(res, 404, { error: "token not found", address });
+    }
+    if (token.blocked) {
+      // Blocked assets are rejected for stream creation/funding, but the raw
+      // identifiers are still returned so the UI can display them.
+      return sendJson(res, 403, {
+        error: "asset blocked",
+        code: "ASSET_BLOCKED",
+        reason: token.blockedReason ?? "asset blocked",
+        token,
+      });
+    }
+    return sendJson(res, 200, token);
+  }
+
+  // Simulate an unknown-metadata response for arbitrary addresses.
+  const tokenMetadata = url.pathname.match(/^\/v1\/tokens\/([^/]+)\/metadata$/);
+  if (req.method === "GET" && tokenMetadata) {
+    const address = decodeURIComponent(tokenMetadata[1]);
+    const token = lookupToken(address);
+    if (token.blocked) {
+      return sendJson(res, 403, {
+        error: "asset blocked",
+        code: "ASSET_BLOCKED",
+        reason: token.blockedReason ?? "asset blocked",
+        token,
+      });
+    }
+    return sendJson(res, 200, token);
+  }
+
   const streamDetail = url.pathname.match(/^\/v1\/streams\/(\d+)$/);
   if (req.method === "GET" && streamDetail) {
     return sendJson(res, 200, stream);
@@ -191,6 +452,96 @@ function handleRest(req, res) {
       page: Number(url.searchParams.get("page") || 1),
       limit: Number(url.searchParams.get("limit") || 20),
     });
+  }
+
+  // ── Recurring schedules ────────────────────────────────────────────────────
+
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/v1/schedules" || url.pathname === "/api/v1/schedules")
+  ) {
+    return sendJson(res, 200, { data: schedules });
+  }
+
+  if (
+    req.method === "POST" &&
+    (url.pathname === "/v1/schedules" || url.pathname === "/api/v1/schedules")
+  ) {
+    return readBody(req)
+      .then((body) => {
+        if (!body || typeof body !== "object") {
+          return sendJson(res, 400, { error: "invalid body" });
+        }
+        if (body.networkPassphrase && body.networkPassphrase !== Networks.TESTNET) {
+          return sendJson(res, 422, {
+            error: "wallet_network_mismatch",
+            message: "Wallet network does not match the schedule network",
+          });
+        }
+        const amountPerRun = String(body.amountPerRun ?? SCHEDULE_FUNDING_AMOUNT);
+        const available = BigInt(body.availableBalance ?? "10000000000");
+        if (available < BigInt(amountPerRun) + BigInt(SCHEDULE_FUNDING_FEE)) {
+          return sendJson(res, 422, {
+            error: "insufficient_funds",
+            message: "Available balance does not cover the next run",
+          });
+        }
+        const created = createSchedule({
+          id: `sched-${schedules.length + 1}`,
+          amountPerRun,
+          recipient: body.recipient ?? RECIPIENT_PUBLIC_KEY,
+          intervalSeconds: Number(body.intervalSeconds ?? SCHEDULE_INTERVAL_SECONDS),
+          availableBalance: available.toString(),
+          streams: [],
+        });
+        schedules = [...schedules, created];
+        return sendJson(res, 201, created);
+      })
+      .catch(() => sendJson(res, 400, { error: "invalid json" }));
+  }
+
+  const scheduleDetail = url.pathname.match(/^\/v1\/schedules\/([^/]+)$/);
+  if (req.method === "GET" && scheduleDetail) {
+    const schedule = findSchedule(decodeURIComponent(scheduleDetail[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    return sendJson(res, 200, schedule);
+  }
+
+  const scheduleFunding = url.pathname.match(/^\/v1\/schedules\/([^/]+)\/funding$/);
+  if (req.method === "GET" && scheduleFunding) {
+    const schedule = findSchedule(decodeURIComponent(scheduleFunding[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    return sendJson(res, 200, scheduleFundingPreview(schedule));
+  }
+
+  const schedulePause = url.pathname.match(/^\/v1\/schedules\/([^/]+)\/pause$/);
+  if (req.method === "POST" && schedulePause) {
+    const schedule = findSchedule(decodeURIComponent(schedulePause[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    if (schedule.status === "cancelled") {
+      return sendJson(res, 409, { error: "schedule_cancelled" });
+    }
+    const updated = {
+      ...schedule,
+      status: "paused",
+      updatedAt: new Date().toISOString(),
+    };
+    schedules = schedules.map((s) => (s.id === updated.id ? updated : s));
+    return sendJson(res, 200, updated);
+  }
+
+  const scheduleCancel = url.pathname.match(/^\/v1\/schedules\/([^/]+)\/cancel$/);
+  if (req.method === "POST" && scheduleCancel) {
+    const schedule = findSchedule(decodeURIComponent(scheduleCancel[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    const updated = {
+      ...schedule,
+      status: "cancelled",
+      nextRunAt: null,
+      updatedAt: new Date().toISOString(),
+    };
+    schedules = schedules.map((s) => (s.id === updated.id ? updated : s));
+    return sendJson(res, 200, updated);
   }
 
   if (req.method === "GET" && url.pathname === "/v1/events/subscribe") {
@@ -214,6 +565,22 @@ function handleRest(req, res) {
     return;
   }
 
+  // E2E control: force a token to be reported as blocked.
+  const blockControl = url.pathname.match(/^\/__e2e\/token\/([^/]+)\/block$/);
+  if (req.method === "POST" && blockControl) {
+    const address = decodeURIComponent(blockControl[1]);
+    const existing = TOKEN_FIXTURES[address] ?? lookupToken(address);
+    TOKEN_FIXTURES[address] = {
+      ...existing,
+      address,
+      blocked: true,
+      verification: "blocked",
+      verified: false,
+      blockedReason: "Asset is on the operator blocklist",
+    };
+    return sendJson(res, 200, { ok: true, token: TOKEN_FIXTURES[address] });
+  }
+
   const withdrawControl = url.pathname.match(/^\/__e2e\/stream\/(\d+)\/withdraw$/);
   if (req.method === "POST" && withdrawControl) {
     const current = Number(stream.withdrawnAmount) || 0;
@@ -225,6 +592,36 @@ function handleRest(req, res) {
     };
     broadcast("stream.withdrawn", { streamId: 42 });
     return sendJson(res, 200, { ok: true, withdrawnAmount: stream.withdrawnAmount });
+  }
+
+  // Deterministic control hooks for schedule failure states.
+  const scheduleControl = url.pathname.match(/^\/__e2e\/schedule\/([^/]+)\/(miss|fund|reset)$/);
+  if (req.method === "POST" && scheduleControl) {
+    const id = decodeURIComponent(scheduleControl[1]);
+    const action = scheduleControl[2];
+    const schedule = findSchedule(id);
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+
+    let updated = schedule;
+    if (action === "miss") {
+      updated = {
+        ...schedule,
+        nextRunAt: nowSec() - 3600,
+        missedRuns: schedule.missedRuns + 1,
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (action === "fund") {
+      updated = {
+        ...schedule,
+        availableBalance: "0",
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (action === "reset") {
+      updated = createSchedule({ id: schedule.id });
+    }
+
+    schedules = schedules.map((s) => (s.id === updated.id ? updated : s));
+    return sendJson(res, 200, updated);
   }
 
   return sendJson(res, 404, { error: "not found" });
@@ -246,17 +643,17 @@ function successTxResultBase64() {
   return new xdr.TransactionResult({
     feeCharged: xdr.Int64.fromString("0"),
     result: xdr.TransactionResultResult.txSuccess([]),
-    ext: new xdr.TransactionResultExt(0),
+    ext: xdr.TransactionResultExt.v0(),
   }).toXDR("base64");
 }
 
 function zeroTxMetaBase64() {
-  return new xdr.TransactionMeta(0, []).toXDR("base64");
+  return xdr.TransactionMeta.operations([]).toXDR("base64");
 }
 
 function dummyEnvelopeBase64() {
   return new TransactionBuilder(
-    Keypair.fromPublicKey(SESSION_PUBLIC_KEY),
+    new Account(SESSION_PUBLIC_KEY, "1"),
     { fee: "1", networkPassphrase: Networks.TESTNET },
   )
     .setTimeout(30)
@@ -380,15 +777,16 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`[mock-api] rest+sse listening on http://localhost:${PORT}`);
 });
 
-if (!fs.existsSync(CERT_PATH) || !fs.existsSync(KEY_PATH)) {
-  console.error("[mock-api] missing TLS certs — run the pw global-setup first (playwright install)");
+const useHttp = process.env.MOCK_RPC_HTTP === "1";
+if (!useHttp && (!fs.existsSync(CERT_PATH) || !fs.existsSync(KEY_PATH))) {
+  console.error("[mock-api] missing TLS certs");
   process.exit(1);
 }
 
-const rpcServer = https.createServer(
+const rpcServer = useHttp ? http.createServer(handleRpc) : https.createServer(
   { cert: fs.readFileSync(CERT_PATH), key: fs.readFileSync(KEY_PATH) },
   handleRpc,
 );
-rpcServer.listen(RPC_PORT, "0.0.0.0", () => {
-  console.log(`[mock-api] soroban rpc listening on https://localhost:${RPC_PORT}`);
+rpcServer.listen(RPC_PORT, "127.0.0.1", () => {
+  console.log(`[mock-api] soroban rpc listening on port ${RPC_PORT}`);
 });

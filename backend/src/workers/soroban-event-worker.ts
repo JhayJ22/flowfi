@@ -4,8 +4,17 @@ import { rpc, xdr, StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../lib/prisma.js";
 import { recordAuditEvent } from "../services/audit.service.js";
 import { INDEXER_STATE_ID, ensureIndexerState } from "../lib/indexer-state.js";
+import {
+  loadEnabledIndexerConfigs,
+  advanceIndexerConfigCursor,
+  type IndexerContractConfig,
+} from "../lib/indexer-config.js";
 import { sseService } from "../services/sse.service.js";
-import { publishIndexerLag, quarantineEvent } from "../services/indexerService.js";
+import {
+  publishIndexerLag,
+  quarantineEvent,
+  detectAndRepairReorg,
+} from "../services/indexerService.js";
 import {
   indexerEventsProcessedTotal,
   indexerPollsTotal,
@@ -151,6 +160,7 @@ export interface IndexerEventCounters {
 
 export class SorobanEventWorker {
   private readonly contractId: string;
+  private readonly networkPassphrase: string;
   private readonly server: rpc.Server;
   private readonly pollIntervalMs: number;
   private readonly startLedger: number;
@@ -195,6 +205,10 @@ export class SorobanEventWorker {
 
   constructor() {
     this.contractId = process.env.STREAM_CONTRACT_ID ?? "";
+    this.networkPassphrase =
+      process.env.STELLAR_NETWORK_PASSPHRASE ??
+      process.env.SOROBAN_NETWORK_PASSPHRASE ??
+      "Test SDF Network ; September 2015";
     const rpcUrl =
       process.env.SOROBAN_RPC_URL ?? "https://soroban-testnet.stellar.org";
     this.server = new rpc.Server(rpcUrl, { allowHttp: true });
@@ -295,19 +309,25 @@ export class SorobanEventWorker {
   }
 
   /**
-   * Start the polling worker. If `STREAM_CONTRACT_ID` is not configured the
-   * worker logs a warning and exits gracefully instead of throwing.
+   * Start the polling worker. If neither `STREAM_CONTRACT_ID` nor any enabled
+   * per-contract indexing configuration is present the worker logs a warning
+   * and exits gracefully instead of throwing.
    */
   async start(): Promise<void> {
-    if (!this.contractId) {
+    const configs = await this.loadConfigs();
+    if (!this.contractId && configs.length === 0) {
       logger.warn(
-        "[SorobanWorker] STREAM_CONTRACT_ID is not set — event indexing disabled.",
+        "[SorobanWorker] STREAM_CONTRACT_ID is not set and no enabled indexer " +
+          "configurations exist — event indexing disabled.",
       );
       return;
     }
 
     this.isRunning = true;
-    logger.info("[SorobanWorker] Starting Soroban event indexer…");
+    logger.info(
+      `[SorobanWorker] Starting Soroban event indexer ` +
+        `(${configs.length} per-contract config(s))…`,
+    );
 
     // Acquire the poll lease before the first cycle. If another replica owns
     // it we still schedule polls so we can take over once it expires.
@@ -554,6 +574,23 @@ export class SorobanEventWorker {
   }
 
   /**
+   * Load the enabled per-contract indexing configurations. Returns an empty
+   * array (and logs) when the configuration store cannot be read so a
+   * transient DB error never halts the worker.
+   */
+  private async loadConfigs(): Promise<IndexerContractConfig[]> {
+    try {
+      return await loadEnabledIndexerConfigs();
+    } catch (err) {
+      logger.error(
+        "[SorobanWorker] Failed to load per-contract indexer configurations:",
+        err,
+      );
+      return [];
+    }
+  }
+
+  /**
    * Canonical header for one ledger, or null when the RPC node cannot serve it
    * (pruned from retention, node desynced, transient error). Public so the
    * operator recovery path in `indexerService` can reuse it.
@@ -652,6 +689,256 @@ export class SorobanEventWorker {
     }
     const fencingToken = this.fencingToken;
 
+    // Load the enabled per-contract configurations for this cycle. Each config
+    // owns an independent cursor, event schema version and network identity.
+    const configs = await this.loadConfigs();
+
+    if (configs.length === 0) {
+      // No per-contract configs: fall back to the legacy single-contract path
+      // so existing deployments keep working unchanged.
+      await this.runLegacyPollCycle(fencingToken);
+      return;
+    }
+
+    for (const config of configs) {
+      // Never advance a cursor without the lease; a concurrent takeover may
+      // have happened while earlier configs were processed.
+      if (!this.leaseHeld || this.fencingToken === null) {
+        logger.warn(
+          "[SorobanWorker] Aborting per-contract poll — indexer lease not held.",
+        );
+        return;
+      }
+
+      // Skip configs whose network identity does not match this worker's
+      // configured network. Indexing a contract on a different network would
+      // corrupt cursors and event schemas.
+      if (
+        config.networkPassphrase &&
+        config.networkPassphrase !== this.networkPassphrase
+      ) {
+        logger.debug?.(
+          `[SorobanWorker] Skipping config ${config.configKey} — network ` +
+            `passphrase mismatch (config=${config.networkPassphrase}).`,
+        );
+        continue;
+      }
+
+      try {
+        await this.runConfigPollCycle(config, fencingToken);
+      } catch (err) {
+        // A failure on one config must not stall the others.
+        logger.error(
+          `[SorobanWorker] Poll cycle failed for config ${config.configKey}:`,
+          err,
+        );
+      }
+    }
+  }
+
+  /**
+   * Poll a single per-contract configuration. Fetches events filtered by the
+   * config's contract address, decodes with its event schema version, and
+   * advances only that config's cursor.
+   */
+  private async runConfigPollCycle(
+    config: IndexerContractConfig,
+    fencingToken: number,
+  ): Promise<void> {
+    const baseFilter = {
+      filters: [
+        {
+          type: "contract" as const,
+          contractIds: [config.contractAddress],
+        },
+      ],
+      limit: 100,
+    } satisfies Omit<
+      Parameters<rpc.Server["getEvents"]>[0],
+      "startLedger" | "cursor"
+    >;
+
+    // Prefer cursor-based pagination after the first poll so we never
+    // re-process events.
+    const params: Parameters<rpc.Server["getEvents"]>[0] = config.lastCursor
+      ? { ...baseFilter, cursor: config.lastCursor }
+      : {
+          ...baseFilter,
+          startLedger: config.lastLedger || config.startLedger || this.startLedger,
+        };
+
+    const rpcStart = Date.now();
+    let response: Awaited<ReturnType<rpc.Server["getEvents"]>>;
+    try {
+      response = await this.server.getEvents(params);
+      recordRpcRequest("getEvents", (Date.now() - rpcStart) / 1000, "success");
+    } catch (err) {
+      recordRpcRequest("getEvents", (Date.now() - rpcStart) / 1000, "error");
+      indexerPollsTotal.inc({ outcome: "rpc_error" });
+      recordIndexerRetry("rpc");
+      throw err;
+    }
+
+    const networkLedger = response.latestLedger ?? 0;
+    recordIndexerLag(Math.max(0, networkLedger - config.lastLedger));
+
+    if (response.events.length === 0) {
+      indexerPollsTotal.inc({ outcome: "empty" });
+      publishIndexerLag(config.lastLedger, networkLedger);
+      recordIndexerLastSuccess();
+      logger.debug?.(
+        `[SorobanWorker] Config ${config.configKey}: no new events ` +
+          `(lastLedger=${config.lastLedger}).`,
+      );
+      return;
+    }
+
+    let lastCursor: string | null = config.lastCursor;
+    let lastLedger: number = config.lastLedger;
+    let sawSuccess = false;
+    const processedByLedger = new Map<
+      number,
+      Array<{ ledgerSequence: number; transactionHash: string; eventType: string }>
+    >();
+
+    const sortedEvents = [...response.events].sort((a, b) => {
+      if (a.ledger !== b.ledger) return a.ledger - b.ledger;
+      const aType = a.topic[0] ? decodeSymbol(a.topic[0]) : "";
+      const bType = b.topic[0] ? decodeSymbol(b.topic[0]) : "";
+      const aIsCreated = aType === "stream_created" ? 0 : 1;
+      const bIsCreated = bType === "stream_created" ? 0 : 1;
+      if (aIsCreated !== bIsCreated) return aIsCreated - bIsCreated;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+
+    let batch: rpc.Api.EventResponse[] = [];
+    let batchStartedAt = Date.now();
+
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0) return;
+      const pending = batch;
+      batch = [];
+      batchStartedAt = Date.now();
+
+      const result = await this.persistEventBatch(pending);
+      if (result.processed > 0) {
+        sawSuccess = true;
+        lastCursor = result.lastCursor ?? lastCursor;
+        lastLedger = result.lastLedger ?? lastLedger;
+        for (const entry of result.processedEvents) {
+          const ledgerEvents = processedByLedger.get(entry.ledgerSequence) ?? [];
+          ledgerEvents.push(entry);
+          processedByLedger.set(entry.ledgerSequence, ledgerEvents);
+        }
+      }
+    };
+
+    for (const event of sortedEvents) {
+      if (!event.inSuccessfulContractCall) continue;
+
+      const decodeStart = Date.now();
+      const eventType = event.topic[0] ? decodeSymbol(event.topic[0]) : "unknown";
+      recordIndexerDecodeLatency((Date.now() - decodeStart) / 1000);
+
+      try {
+        const persistStart = Date.now();
+        await this.processEvent(event);
+        recordIndexerPersistLatency((Date.now() - persistStart) / 1000);
+        this.eventsProcessed += 1;
+        this.recordOutcome(true);
+        sawSuccess = true;
+        const ledgerEvents = processedByLedger.get(event.ledger) ?? [];
+        ledgerEvents.push({
+          ledgerSequence: event.ledger,
+          transactionHash: event.txHash,
+          eventType,
+        });
+        processedByLedger.set(event.ledger, ledgerEvents);
+        lastCursor = event.id;
+        lastLedger = event.ledger;
+        indexerEventsProcessedTotal.inc({ eventType, result: "processed" });
+      } catch (err) {
+        indexerEventsProcessedTotal.inc({ eventType, result: "quarantined" });
+        recordIndexerRetry("quarantine");
+        logger.error(
+          `[SorobanWorker] Failed to process event ${event.id} ` +
+            `(config ${config.configKey}):`,
+          err,
+        );
+        await quarantineEvent(event, err);
+      }
+
+      batch.push(event);
+
+      const elapsed = Date.now() - batchStartedAt;
+      if (
+        batch.length >= this.batchMaxSize ||
+        elapsed >= this.batchMaxDurationMs
+      ) {
+        await flush();
+      }
+    }
+    await flush();
+
+    for (const [, ledgerEvents] of processedByLedger) {
+      recordIndexerEventsPerLedger(ledgerEvents.length);
+    }
+
+    const finalCursor = sawSuccess
+      ? ((response as any).latestCursor || lastCursor)
+      : lastCursor;
+
+    if (this.checkpointsEnabled) {
+      await this.recordLedgerCheckpoints(processedByLedger);
+    }
+
+    // Advance only this config's cursor, fenced by the current lease token.
+    const persisted = await this.persistConfigCursorFenced(
+      fencingToken,
+      config.configKey,
+      lastLedger,
+      finalCursor,
+    );
+    if (!persisted) {
+      this.handleLeaseLoss("fenced per-contract cursor write rejected");
+      return;
+    }
+
+    indexerPollsTotal.inc({ outcome: "processed" });
+    publishIndexerLag(lastLedger, networkLedger);
+    recordIndexerLastSuccess();
+
+    logger.info(
+      `[SorobanWorker] Config ${config.configKey}: processed ` +
+        `${response.events.length} event(s) — latest ledger: ${lastLedger}`,
+    );
+  }
+
+  /**
+   * Advance a single per-contract config's cursor only if `fencingToken` still
+   * matches the lease held in the database. Returns false when the write was
+   * fenced out (the lease was lost or taken over), in which case the caller
+   * must stop.
+   */
+  private async persistConfigCursorFenced(
+    fencingToken: number,
+    configKey: string,
+    lastLedger: number,
+    lastCursor: string | null,
+  ): Promise<boolean> {
+    const held = await isLeaseHeld(this.ownerId, fencingToken);
+    if (!held) return false;
+
+    await advanceIndexerConfigCursor(configKey, lastLedger, lastCursor);
+    return true;
+  }
+
+  /**
+   * Legacy single-contract poll path used when no per-contract configurations
+   * are present. Preserves the original global-cursor behaviour so existing
+   * deployments keep working unchanged.
+   */
+  private async runLegacyPollCycle(fencingToken: number): Promise<void> {
     // Ensure an IndexerState row exists on first run.
     let state = await ensureIndexerState(this.startLedger);
 
@@ -677,6 +964,35 @@ export class SorobanEventWorker {
         // A failure to verify is not a reorg: keep indexing forward rather than
         // halting the pipeline on a transient RPC/DB error.
         logger.error("[SorobanWorker] Ledger checkpoint verification failed:", err);
+      }
+    }
+
+    // Chain-block reorg classification (issue #246): compare the canonical
+    // ledger hashes we are about to ingest against the ChainBlock rows we have
+    // already stored. A mismatch means the RPC is serving a fork that diverges
+    // from previously observed data; repair the affected projections and
+    // resume from the repaired cursor instead of persisting orphaned events.
+    if (this.checkpointsEnabled) {
+      try {
+        const reorg = await detectAndRepairReorg({
+          fetchLedgerHeader: (sequence) => this.fetchLedgerHeader(sequence),
+          alertThreshold: this.reorgAlertThreshold,
+          ownerId: this.ownerId,
+        });
+        if (reorg.detected) {
+          logger.warn(
+            `[SorobanWorker] Chain reorg classified (depth=${reorg.depth}, ` +
+              `safeLedger=${reorg.safeLedger}); repaired projections and ` +
+              `resuming from repaired cursor.`,
+          );
+          // Re-read state so the cursor reflects the repaired position and no
+          // orphaned events are re-fetched from the stale fork.
+          state = await ensureIndexerState(this.startLedger);
+        }
+      } catch (err) {
+        // A verification failure is not a reorg: keep indexing forward rather
+        // than halting the pipeline on a transient RPC/DB error.
+        logger.error("[SorobanWorker] Chain reorg detection failed:", err);
       }
     }
 
@@ -714,6 +1030,39 @@ export class SorobanEventWorker {
     // The network tip is reported alongside every batch, so lag is observable
     // even on cycles that return no events.
     const networkLedger = response.latestLedger ?? 0;
+
+    // Post-fetch reorg guard (issue #246): the fetched events may belong to a
+    // fork that diverged from the canonical chain after the pre-ingestion
+    // check. Re-verify the ledgers we are about to persist against stored
+    // ChainBlock rows; if a reorg is detected, repair projections and skip
+    // persisting this batch entirely so no orphaned events are written.
+    if (this.checkpointsEnabled && response.events.length > 0) {
+      try {
+        const reorg = await detectAndRepairReorg({
+          fetchLedgerHeader: (sequence) => this.fetchLedgerHeader(sequence),
+          alertThreshold: this.reorgAlertThreshold,
+          ownerId: this.ownerId,
+        });
+        if (reorg.detected) {
+          logger.warn(
+            `[SorobanWorker] Reorg detected mid-cycle (depth=${reorg.depth}, ` +
+              `safeLedger=${reorg.safeLedger}); discarding fetched batch and ` +
+              `resuming from repaired cursor.`,
+          );
+          indexerPollsTotal.inc({ outcome: "reorg" });
+          // Do not persist the orphaned batch. The next poll re-reads the
+          // repaired cursor and re-fetches canonical events from there.
+          return;
+        }
+      } catch (err) {
+        logger.error(
+          "[SorobanWorker] Mid-cycle reorg detection failed; skipping batch to avoid persisting potentially orphaned events:",
+          err,
+        );
+        indexerPollsTotal.inc({ outcome: "reorg_check_error" });
+        return;
+      }
+    }
 
     // Lag in ledgers between the last indexed ledger and the network tip.
     // Bounded labels only (no tx hashes / addresses).
@@ -870,6 +1219,33 @@ export class SorobanEventWorker {
       // Ownership was lost mid-cycle; do not report success or advance lag.
       this.handleLeaseLoss("fenced cursor write rejected");
       return;
+    }
+
+    // Post-persist reorg guard (issue #246): if a reorg was classified while
+    // this batch was being persisted, the repair path has already rolled back
+    // the affected projections and reset the cursor. Re-read state so the next
+    // poll resumes from the repaired cursor rather than the stale fork.
+    if (this.checkpointsEnabled) {
+      try {
+        const reorg = await detectAndRepairReorg({
+          fetchLedgerHeader: (sequence) => this.fetchLedgerHeader(sequence),
+          alertThreshold: this.reorgAlertThreshold,
+          ownerId: this.ownerId,
+        });
+        if (reorg.detected) {
+          logger.warn(
+            `[SorobanWorker] Reorg classified after persist (depth=${reorg.depth}, ` +
+              `safeLedger=${reorg.safeLedger}); cursor reset to repaired position.`,
+          );
+          indexerPollsTotal.inc({ outcome: "reorg" });
+          return;
+        }
+      } catch (err) {
+        logger.error(
+          "[SorobanWorker] Post-persist reorg detection failed:",
+          err,
+        );
+      }
     }
 
     indexerPollsTotal.inc({ outcome: "processed" });
