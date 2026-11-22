@@ -83,6 +83,43 @@ concrete IDs does not explode series cardinality.
 | DB pool contention | `flowfi_db_pool_waiting_requests > 0 for 2m` |
 | Quarantined events | `increase(flowfi_indexer_events_processed_total{result="quarantined"}[1h]) > 0` |
 
+## Rollback decision evidence
+
+A single liveness probe is not enough to justify a rollback. The rollback
+decision helper (`src/lib/rollbackDecision.ts`) aggregates four independent
+signals into one transparent recommendation. It **only recommends** — it never
+executes a rollback. Execution stays a human/operator action gated on the
+recommendation and the runbook.
+
+### Signals and thresholds
+
+| Signal | Source | Threshold | Owner |
+| --- | --- | --- | --- |
+| Health | `/health` probe result | `unhealthy` → rollback signal | Platform on-call |
+| Indexer lag | `flowfi_indexer_lag_ledgers` | `> 60` ledgers → rollback signal | Indexer owner |
+| Migration | latest migration status | `failed` / `pending` → rollback signal | Backend owner |
+| Error rate | `flowfi_http_requests_total{status=~"5.."}` ratio | `> 5%` over the window → rollback signal | Backend owner |
+
+### Recommendation rules
+
+- **rollback** — any *critical* signal (health unhealthy, migration failed) or
+  at least two degraded signals agree.
+- **hold** — exactly one degraded signal, or insufficient evidence.
+- **proceed** — all signals healthy.
+
+### Missing metrics
+
+A signal with no data is reported as `unknown`, never as healthy. If any signal
+is `unknown` the overall recommendation is at best `hold` (insufficient
+evidence) so a missing metric can never trigger a false-positive rollback.
+
+### Decision ownership
+
+The recommendation is advisory. The owning on-call engineer for the failing
+signal confirms the evidence and decides whether to execute the rollback per the
+runbook; the helper records which signals drove the recommendation so the
+decision is auditable.
+
 ## Grafana
 
 `grafana-dashboard.json` is an importable dashboard covering all of the above.
@@ -116,6 +153,67 @@ itself, because ES module imports are hoisted past the entrypoint's own
 Telemetry never blocks serving: a failed SDK start logs a warning and the
 process continues untraced.
 
+## Dependency outage game days
+
+Repeatable game days for the four external dependencies the backend cannot
+serve without: **database**, **cache**, **Soroban RPC**, and **webhook
+providers**. Each game day runs in an isolated environment, records detection
+and recovery outcomes, and asserts that outages fail closed — no unsafe
+mutation fallback — with production execution gated behind explicit approval.
+
+### Isolation rules
+
+- Run against a dedicated stack (`docker compose -f docker-compose.gameday.yml`)
+  with its own database, cache, and a stub RPC/webhook endpoint. Never point a
+game day at staging or production data.
+- Use a throwaway `DATABASE_URL` and `REDIS_URL`; the stack is torn down after
+  each run so state cannot leak between scenarios.
+- Production execution is **opt-in only**: the runner refuses to target a
+  production environment unless `GAMEDAY_ALLOW_PRODUCTION=true` is set *and* an
+  approver is recorded in the run log. Default is isolated-only.
+
+### Scenarios
+
+| Scenario | Injection | Expected detection | Expected recovery |
+| --- | --- | --- | --- |
+| Database outage | Stop the DB container / revoke connections | `flowfi_db_pool_waiting_requests` rises, `flowfi_http_requests_total{status=~"5.."}` climbs | Pool drains, 5xx rate returns to baseline |
+| Cache outage | Stop the cache container | Cache-miss latency rises; requests still served from source of truth | Latency returns to baseline once cache is back |
+| Soroban RPC outage | Point `SOROBAN_RPC_URL` at a stub that times out | `flowfi_rpc_circuit_breaker_trips_total` increments, `flowfi_indexer_polls_total{outcome="rpc_error"}` climbs | Breaker closes, indexer lag recovers |
+| Webhook provider outage | Stub returns 5xx / hangs | Delivery retries logged, no partial mutation committed | Retries succeed, no duplicate side effects |
+
+### Fail-closed assertions
+
+Every scenario must confirm that mutations **fail closed** during the outage:
+
+- Write endpoints return an error (5xx / 503) rather than silently succeeding or
+  falling back to an in-memory or unauthenticated path.
+- No partial financial state is committed; accounting invariants hold after
+  recovery.
+- Wallet authorization and chain/network validation are never bypassed to keep
+  serving during an outage.
+
+### Recording outcomes
+
+Each run appends a structured record so game days are repeatable and diffable:
+
+```json
+{
+  "scenario": "soroban_rpc_outage",
+  "environment": "isolated",
+  "startedAt": "2024-01-01T00:00:00Z",
+  "detected": true,
+  "detectionSignal": "flowfi_rpc_circuit_breaker_trips_total > 0",
+  "recovered": true,
+  "recoverySeconds": 42,
+  "failClosed": true,
+  "productionApproved": false
+}
+```
+
+A run is only considered passing when `detected`, `recovered`, and
+`failClosed` are all `true`. Production runs additionally require
+`productionApproved: true`.
+
 ## Configuration reference
 
 | Variable | Default | Purpose |
@@ -126,3 +224,97 @@ process continues untraced.
 | `SOROBAN_RPC_TIMEOUT_MS` | `10000` | Per-call RPC deadline (drives breaker trips) |
 | `SOROBAN_RPC_MAX_RETRIES` | `2` | Retry budget (drives failover counts) |
 | `SIMULATION_VALIDITY_LEDGERS` | `10` | Ledgers a `/simulate` footprint stays fresh for |
+
+## Incident evidence and post-incident review
+
+Use this template to record evidence during a production incident and to drive
+the post-incident review (PIR). Copy it into the incident ticket; do not store
+it in this repository. Keep the record factual and minimal — capture only what
+is needed to reconstruct impact and recovery.
+
+**Privacy:** record roles and on-call handles, not personal names, emails, or
+customer identifiers. Reference streams/transactions by internal ID or hash,
+never by wallet owner identity. Redact secrets, bearer tokens, and full RPC
+payloads before pasting logs.
+
+### 1. Summary
+
+| Field | Value |
+| --- | --- |
+| Incident ID | |
+| Severity | SEV1 / SEV2 / SEV3 |
+| Status | investigating / mitigating / monitoring / resolved |
+| Detected (UTC) | |
+| Resolved (UTC) | |
+| Incident commander (role) | |
+| Comms lead (role) | |
+| Affected environment | staging / production |
+| Affected network | testnet / mainnet |
+
+### 2. Impact
+
+- User-visible symptoms and the surface affected (API, SSE stream, indexer,
+  webhooks).
+- Blast radius: number of streams/transactions affected, expressed as counts or
+  ranges — no per-user breakdowns.
+- Data integrity: was any ledger, event, or accounting record lost, duplicated,
+  or mis-ordered? State yes/no and the evidence.
+- Financial invariants: confirm whether balances, escrow, or settlement totals
+  remained consistent. If not, link the reconciliation evidence.
+
+### 3. Timeline (UTC)
+
+| Time | Event | Evidence link |
+| --- | --- | --- |
+| | First signal / alert fired | |
+| | Incident declared | |
+| | Mitigation started | |
+| | Service restored | |
+| | Incident closed | |
+
+### 4. Chain state
+
+- Indexer `current_ledger` vs `network_ledger` at detection and at recovery
+  (`flowfi_indexer_current_ledger`, `flowfi_indexer_network_ledger`,
+  `flowfi_indexer_lag_ledgers`).
+- Quarantined or dead-lettered events during the window
+  (`flowfi_indexer_events_processed_total{result="quarantined"}`); list event
+  IDs and replay status.
+- RPC health: circuit-breaker trips and failovers per endpoint
+  (`flowfi_rpc_circuit_breaker_trips_total`, `flowfi_rpc_failovers_total`).
+- Any manual ledger rewind, replay, or backfill performed, with the exact
+  command and the operator role that ran it.
+
+### 5. Recovery steps
+
+Record the ordered actions that restored service, each with the operator role
+and the verification that confirmed it worked:
+
+| # | Action | Owner (role) | Verification |
+| --- | --- | --- | --- |
+| 1 | | | |
+| 2 | | | |
+
+Verification must be observable (metric back in range, alert cleared, replay
+count zero, smoke test green) — not "looks fine".
+
+### 6. Follow-up work
+
+Every follow-up item needs an owner role, a due date, and a verification
+criterion so it can be closed objectively.
+
+| # | Action item | Owner (role) | Due | Verification criterion |
+| --- | --- | --- | --- | --- |
+| 1 | | | | |
+| 2 | | | | |
+
+### 7. Runbooks and references
+
+Link to the existing runbooks instead of duplicating their steps:
+
+- Indexer operations and dead-letter replay: [`../indexer-operations.md`](../indexer-operations.md)
+- Metrics, alerting, and tracing: this document (see *Alerting starting points*
+  and *Tracing* above)
+- Grafana dashboard: `grafana-dashboard.json` in this directory
+- Architecture and event ordering: [`../ARCHITECTURE.md`](../ARCHITECTURE.md),
+  [`../EVENT_ORDERING.md`](../EVENT_ORDERING.md)

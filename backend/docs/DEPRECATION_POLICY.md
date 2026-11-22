@@ -140,60 +140,99 @@ X-API-Migration-Path: /v1/streams
 - API changelog updates
 - Response headers for automatic detection
 
-## Generated-Client Compatibility Fixtures
+## Migration Guides by API Version
 
-Generated frontend and partner clients are validated against versioned response
-fixtures so that breaking response changes cannot ship silently.
+Each supported API version has a dedicated migration guide. Every guide links to the
+OpenAPI schema for that version, includes a compatibility checklist, and lists explicit
+deprecation dates and behavior differences.
 
-### Fixture Layout
+| Version | Status | OpenAPI Schema | Migration Guide | Deprecation Date | Sunset Date |
+|---------|--------|----------------|-----------------|------------------|-------------|
+| v1 | Current | [`openapi/v1.yaml`](../openapi/v1.yaml) | [v1 guide](#migration-guide-v1) | — | — |
+| v0 (legacy unversioned) | Removed | [`openapi/v0.yaml`](../openapi/v0.yaml) | [v0 → v1 guide](#migration-guide-v0--v1) | 2024-02-21 | 2024-12-31 |
 
-Fixtures live under `backend/tests/fixtures/api-compat/` and are organized by
-API version:
+> When a new version is introduced, add a row here and a matching guide section below
+> before announcing the deprecation of the previous version.
 
+### Migration Guide: v1
+
+**OpenAPI schema:** [`openapi/v1.yaml`](../openapi/v1.yaml)
+
+**Status:** Current — no deprecation date scheduled.
+
+**Behavior differences from v0:**
+
+- All routes are prefixed with `/v1/` (e.g. `/v1/streams`, `/v1/events`).
+- Responses include `X-API-Deprecated` / `X-API-Sunset-Date` headers when applicable.
+- The `/health` endpoint reports `apiVersions.supported`.
+
+**Compatibility checklist:**
+
+- [ ] All requests use the `/v1/` prefix.
+- [ ] Client reads `apiVersions.supported` from `/health` and fails fast if `v1` is absent.
+- [ ] Client monitors `X-API-Deprecated` headers.
+- [ ] Request/response shapes validated against `openapi/v1.yaml`.
+
+**Tested request/response example:**
+
+```http
+GET /v1/streams HTTP/1.1
+Host: api.flowfi.io
 ```
-backend/tests/fixtures/api-compat/
-  v1/
-    streams.list.json          # current version, representative payload
-    events.list.json
-  v1-deprecated/
-    streams.list.json          # deprecated fields still present
-    events.list.json
-  migrations.json              # migration notes keyed by version + field
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  { "id": "stream_1", "status": "active" }
+]
 ```
 
-Each fixture captures a representative response body for a versioned
-endpoint. The `v1-deprecated/` set intentionally retains fields that are
-scheduled for removal so the deprecation window is exercised.
+### Migration Guide: v0 → v1
 
-### Compatibility Test Expectations
+**OpenAPI schema:** [`openapi/v0.yaml`](../openapi/v0.yaml) (archived) → [`openapi/v1.yaml`](../openapi/v1.yaml)
 
-The compatibility suite (`backend/tests/api-compat.test.ts`) runs the generated
-clients against every fixture and enforces the following:
+**Status:** Removed. Deprecated 2024-02-21, sunset 2024-12-31, handlers deleted 2026-06-30.
 
-1. **No breaking changes without a migration note.** If a fixture's response
-   shape diverges from the recorded baseline (removed field, changed type,
-   renamed key), the test fails unless `migrations.json` contains a matching
-   entry for that version and field.
-2. **Deprecated fields remain present during the window.** Fields listed as
-   deprecated in `migrations.json` must still appear in the `v1-deprecated/`
-   fixtures until their sunset date; removing them early fails the suite.
-3. **Version boundary transitions.** Requests to a sunset version must return
-   `410 Gone` with the documented migration body, while the current version
-   continues to return `200 OK`.
-4. **Missing migration note is a failure.** A breaking change with no
-   corresponding migration note is treated as a hard failure, not a warning.
+**Behavior differences:**
 
-### Adding or Changing a Fixture
+- Unversioned paths (`/streams`, `/events`) no longer exist and return `404`.
+- Versioned paths (`/v1/streams`, `/v1/events`) are the only supported routes.
+- After sunset, calls to removed routes return `410 Gone` with a `migration` body
+  (see [After Sunset](#after-sunset)) until handlers are deleted, then `404`.
 
-When a response shape changes:
+**Compatibility checklist:**
 
-1. Update the affected fixture(s) under the matching version directory.
-2. Add a migration note to `migrations.json` describing the old and new shape,
-   the affected version, and the sunset date.
-3. Run the compatibility suite; it must pass before the change is merged.
+- [ ] Replace every unversioned path with its `/v1/` equivalent.
+- [ ] Update base URL to include `/v1`.
+- [ ] Re-validate payloads against `openapi/v1.yaml`.
+- [ ] Remove any reliance on unversioned-only response fields.
 
-Breaking changes within a version remain disallowed (see below); a new version
-must be introduced instead.
+**Tested request/response example:**
+
+```http
+GET /streams HTTP/1.1
+Host: api.flowfi.io
+```
+
+```http
+HTTP/1.1 404 Not Found
+```
+
+```http
+GET /v1/streams HTTP/1.1
+Host: api.flowfi.io
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  { "id": "stream_1", "status": "active" }
+]
+```
 
 ## Current Deprecations
 

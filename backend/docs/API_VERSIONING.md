@@ -28,15 +28,126 @@ All API endpoints are prefixed with a version identifier:
 
 ## Supported Versions
 
-| Version | Status | Introduced | Sunset Date |
-|---------|--------|------------|-------------|
-| `v1` | ✅ Current | 2024-02-21 | TBD |
+| Version | Status | Introduced | Sunset Date | OpenAPI Schema |
+|---------|--------|------------|-------------|----------------|
+| `v1` | ✅ Current | 2024-02-21 | TBD | [openapi/v1.yaml](../openapi/v1.yaml) |
 
 ### Version Lifecycle
 
 1. **Current** - Actively maintained, receives new features and bug fixes
 2. **Deprecated** - Still supported but will be sunset on a specific date
 3. **Sunset** - No longer available, returns 410 Gone
+
+## Migration Guides
+
+Each supported API version has a dedicated migration guide below. Every guide links to its OpenAPI schema, lists explicit behavior differences and timelines, and includes a compatibility checklist with deprecation dates.
+
+### Migrating to v1
+
+**OpenAPI schema:** [openapi/v1.yaml](../openapi/v1.yaml)
+
+**Behavior differences vs. unversioned (pre-v1) routes:**
+
+| Area | Pre-v1 (unversioned) | v1 |
+|------|----------------------|----|
+| Base path | `/streams` | `/v1/streams` |
+| Unsupported version | n/a | `400` with `supportedVersions` |
+| Deprecation signaling | none | `X-API-Deprecated`, `X-API-Sunset-Date`, `X-API-Migration-Path` headers |
+| Version discovery | none | `/health` returns `apiVersions` |
+
+**Timeline:**
+
+- `2024-02-21` — v1 introduced (current).
+- Unversioned routes: deprecated; sunset date **2024-12-31** (returns `410 Gone` after).
+- v1 sunset date: **TBD** (minimum 6 months notice before any sunset).
+
+**Compatibility checklist:**
+
+- [ ] All requests use the `/v1` prefix (no unversioned paths).
+- [ ] Client pins to `v1` explicitly rather than relying on the default.
+- [ ] Client reads `X-API-Deprecated` / `X-API-Sunset-Date` headers and logs warnings.
+- [ ] Client handles `400` unsupported-version responses using `supportedVersions`.
+- [ ] Client queries `/health` `apiVersions` at startup to confirm `v1` is supported.
+- [ ] Request/response shapes validated against [openapi/v1.yaml](../openapi/v1.yaml).
+
+**Tested request/response examples:**
+
+Create a stream:
+
+```bash
+POST /v1/streams
+Content-Type: application/json
+
+{
+  "sender": "GABC...",
+  "recipient": "GDEF...",
+  "tokenAddress": "CBCD...",
+  "amount": "10000",
+  "duration": 86400
+}
+```
+
+Response `201 Created`:
+
+```json
+{
+  "id": "1",
+  "sender": "GABC...",
+  "recipient": "GDEF...",
+  "tokenAddress": "CBCD...",
+  "amount": "10000",
+  "duration": 86400,
+  "status": "active"
+}
+```
+
+Subscribe to events:
+
+```bash
+GET /v1/events/subscribe?streams=1&streams=2
+Accept: text/event-stream
+```
+
+Response `200 OK` (`text/event-stream`):
+
+```
+event: connected
+data: {"streams":["1","2"]}
+```
+
+Unsupported version (boundary case):
+
+```bash
+GET /v2/streams
+```
+
+Response `400 Bad Request`:
+
+```json
+{
+  "error": "Unsupported API version",
+  "message": "API version 'v2' is not supported. Supported versions: v1",
+  "supportedVersions": ["v1"]
+}
+```
+
+Sunset endpoint (failure case):
+
+```bash
+GET /streams
+```
+
+Response `410 Gone`:
+
+```json
+{
+  "error": "Deprecated endpoint",
+  "message": "This endpoint has been deprecated. Please use /v1/streams instead.",
+  "deprecated": true,
+  "migration": { "old": "/streams", "new": "/v1/streams" },
+  "sunsetDate": "2024-12-31"
+}
+```
 
 ## Adding New Endpoints
 
@@ -83,6 +194,35 @@ router.get('/:streamId', getStreamV2); // New structure
 import v2Routes from './routes/v2/index.js';
 app.use('/v2', v2Routes);
 ```
+
+## Webhook Payload Versioning
+
+Webhook deliveries carry an explicit schema version so downstream consumers can evolve independently of the API version.
+
+### Supported Webhook Versions
+
+| Version | Status | Notes |
+|---------|--------|-------|
+| `v1` | ✅ Current | Default for all deliveries |
+
+- The version is sent in the `X-Webhook-Version` header and mirrored in the payload's `version` field.
+- Consumers MUST reject deliveries whose version they do not support rather than guessing the shape.
+- Adding optional fields is non-breaking; removing or retyping fields requires a new webhook version.
+
+### Delivery Semantics
+
+- **Signature verification** - Every delivery includes an `X-Webhook-Signature` HMAC over the raw body. Consumers MUST verify it before processing and reject mismatches.
+- **Duplicates** - Delivery is at-least-once. Consumers MUST deduplicate using the stable `X-Webhook-Id` / payload `id`.
+- **Out-of-order delivery** - Deliveries may arrive out of order. Consumers MUST order by the payload `sequence` (or event timestamp) rather than arrival time.
+
+### Compatibility Contract Suite
+
+A consumer-driven contract suite lives alongside the webhook tests and publishes reusable fixtures for partners:
+
+- `backend/tests/webhooks/contract/` - contract tests covering supported versions, signature verification, duplicate handling, and out-of-order delivery, including failure and boundary cases (invalid/missing signature, unknown version, replayed duplicate, out-of-order sequence).
+- `backend/tests/webhooks/contract/fixtures/` - versioned payload fixtures partners can reuse to validate their own consumers.
+
+Partners should run their consumer against the published fixtures and treat any fixture that no longer verifies as a breaking change requiring a new webhook version.
 
 ## Deprecation Policy
 
@@ -170,47 +310,60 @@ The API version middleware automatically:
 - Returns 400 for unsupported versions
 - Sets default version if none specified
 
-## Generated-Client Compatibility Fixtures
+## Event Schema Versioning
 
-Generated frontend and partner clients are validated against **versioned response
-fixtures** so that a breaking response change cannot ship silently. Fixtures live
-under `backend/tests/fixtures/api-compat/` and are organized by API version:
+Stream event schemas are published as machine-readable JSON Schema artifacts so downstream consumers can validate payloads and plan compatible upgrades. Event schemas are **versioned independently from package releases** — a schema version bump does not require (and is not tied to) an npm/package version bump.
+
+### Schema Location
+
+Published schemas live under `backend/schemas/` and are named by their schema version:
 
 ```
-backend/tests/fixtures/api-compat/
-  v1/
-    streams.list.json          # current v1 response shape
-    streams.detail.json
-    events.stats.json
-  v1-deprecated/
-    streams.list.json          # deprecated fields still present during window
-  manifest.json                # version -> fixture map + migration notes
+backend/schemas/stream-event.v1.json
 ```
 
-### Compatibility Test Expectations
+Each artifact declares its own `$id` (e.g. `https://flowfi.io/schemas/stream-event.v1.json`) and a `version` field so consumers can pin to a specific schema version regardless of the package version they install.
 
-The compatibility suite (`backend/tests/api-compat.test.ts`) runs the generated
-clients against each fixture and enforces the following:
+### Backward-Compatibility Rules
 
-1. **Current version fixtures** must parse cleanly with the generated client and
-   match the documented response contract. Any removed/renamed field or type
-   change fails the test.
-2. **Deprecated version fixtures** must still parse, and any field marked
-   deprecated in `manifest.json` must remain present until its sunset date.
-3. **Breaking changes require a migration note.** If a fixture diverges from the
-   previous snapshot, the test fails unless `manifest.json` contains a matching
-   `migrationNotes` entry describing the change and its migration path.
-4. **Version boundary transitions** (e.g. `v1` → `v1-deprecated`) are covered so
-   that a field disappearing exactly at the sunset boundary is detected.
+Within a **major** schema version (e.g. `v1`), only **additive** changes are allowed:
 
-### Adding or Updating Fixtures
+- ✅ Adding new **optional** properties
+- ✅ Adding new enum values only when consumers are documented to tolerate unknown values
+- ✅ Relaxing constraints (e.g. widening a `maxLength`)
+- ❌ Adding new **required** properties
+- ❌ Removing or renaming properties
+- ❌ Changing a property's type
+- ❌ Tightening constraints (e.g. narrowing an enum, adding `required`)
 
-When a response shape changes:
+Any breaking change requires publishing a **new major schema version** (e.g. `stream-event.v2.json`). The previous major version remains published and supported during its deprecation window.
 
-1. Add or update the fixture under the appropriate version directory.
-2. If the change is breaking, add a `migrationNotes` entry to `manifest.json`
-   referencing the affected endpoint and the migration path.
-3. Run the compatibility suite; it must pass before merging.
+### Consumer Example
+
+Consumers validate a stream event payload against the published schema before processing it:
+
+```javascript
+import Ajv from 'ajv';
+import schema from 'flowfi-sdk/schemas/stream-event.v1.json' assert { type: 'json' };
+
+const ajv = new Ajv({ strict: false });
+const validate = ajv.compile(schema);
+
+const event = {
+  version: 'v1',
+  type: 'stream.created',
+  streamId: '1',
+  timestamp: '2024-02-21T00:00:00.000Z',
+  payload: { amount: '10000' }
+};
+
+if (!validate(event)) {
+  console.error('Invalid stream event:', validate.errors);
+  throw new Error('Stream event failed schema validation');
+}
+```
+
+Consumers should reject payloads that fail validation, and should treat an unknown `version` as a signal to upgrade their pinned schema rather than silently accepting the payload.
 
 ## Best Practices
 
@@ -221,7 +374,7 @@ When a response shape changes:
 3. **Provide migration guides** - Help consumers upgrade
 4. **Maintain backward compatibility** - Within a version
 5. **Test version isolation** - Ensure versions don't interfere
-6. **Keep compatibility fixtures current** - Update fixtures and migration notes with every response change
+6. **Version event schemas independently** - Bump schema versions separately from package releases and follow the additive-only rule within a major version
 
 ### For API Consumers
 
@@ -230,6 +383,7 @@ When a response shape changes:
 3. **Plan migrations early** - Don't wait until sunset
 4. **Test thoroughly** - Before upgrading versions
 5. **Use health endpoint** - Check supported versions
+6. **Validate event payloads** - Compile the published schema and reject invalid or unknown-version events
 
 ## Examples
 
@@ -269,6 +423,51 @@ Response:
   "supportedVersions": ["v1"]
 }
 ```
+
+## Event Contract Versioning
+
+Event payloads are versioned independently of the HTTP API version. Every event
+carries a `schemaVersion` field (currently `1`) so partner consumers can evolve
+at their own pace without being coupled to the REST surface.
+
+### Event Envelope
+
+```json
+{
+  "id": "evt_01H...",
+  "type": "stream.created",
+  "schemaVersion": 1,
+  "occurredAt": "2024-02-21T12:00:00.000Z",
+  "cursor": "1708516800000-42",
+  "data": { "streamId": "1", "sender": "GABC..." }
+}
+```
+
+### Consumer Contract Rules
+
+1. **Verify the signature before parsing** - Reject events whose HMAC signature
+   does not match the shared secret. Never trust unverified payloads.
+2. **Process idempotently** - Deduplicate on `id`; replays and duplicate
+   deliveries must not double-apply to the local projection.
+3. **Persist the cursor atomically** - Store the last applied `cursor` in the
+   same transaction as the projection update so restarts resume exactly once.
+4. **Recover from gaps** - On reconnect, resume from the persisted cursor and
+   re-request any missed range; never skip ahead silently.
+5. **Redact logs** - Log event `id`, `type`, and `cursor` only. Never log
+   payload bodies, signatures, or secrets.
+
+A reference implementation of these rules lives in
+[`examples/partner-event-consumer`](../examples/partner-event-consumer/README.md).
+
+### Event Schema Version Lifecycle
+
+| `schemaVersion` | Status | Notes |
+|-----------------|--------|-------|
+| `1` | ✅ Current | Initial event envelope |
+
+Adding optional fields to `data` is non-breaking and stays within the current
+`schemaVersion`. Removing or retyping fields requires a new `schemaVersion` and
+a deprecation window matching the HTTP policy above.
 
 ## Future Considerations
 
