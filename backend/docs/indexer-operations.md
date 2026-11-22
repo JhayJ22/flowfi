@@ -412,6 +412,58 @@ state:
 
 ---
 
+## 0. Service dependency budgets and timeout policy
+
+### Behavior
+
+Every outbound dependency call (database, Redis, Soroban RPC, webhooks) is
+wrapped in a centralized budget policy so a slow or failing dependency cannot
+block a request or worker indefinitely. Each dependency has an explicit
+**per-attempt timeout**, a **total budget** (the wall-clock ceiling across all
+attempts including backoff), and a **bounded retry count**. When the budget is
+exhausted the call fails fast with a typed timeout error instead of hanging.
+
+- **Per-attempt timeout.** Each individual attempt is aborted when it exceeds
+  its timeout; the attempt is counted as a failure and retried if budget and
+  retry count remain.
+- **Total budget.** The sum of attempt timeouts plus backoff delays is capped
+  by the total budget. Once the budget is exhausted, no further attempts are
+  made even if the retry count has not been reached.
+- **Bounded retries.** Retries are capped per dependency; backoff is
+  exponential with jitter and is itself bounded by the remaining budget.
+- **No cascade.** A dependency that is down or slow fails within its budget,
+  so request handlers and worker loops return/continue rather than piling up
+  blocked calls.
+
+### Configuration
+
+All budgets are configurable via environment variables and have safe
+defaults. Values are in milliseconds.
+
+| Dependency | Per-attempt timeout | Total budget | Max retries |
+| --- | --- | --- | --- |
+| Database | `DB_CALL_TIMEOUT_MS` | `DB_CALL_BUDGET_MS` | `DB_CALL_MAX_RETRIES` |
+| Redis | `REDIS_CALL_TIMEOUT_MS` | `REDIS_CALL_BUDGET_MS` | `REDIS_CALL_MAX_RETRIES` |
+| Soroban RPC | `SOROBAN_RPC_TIMEOUT_MS` | `SOROBAN_RPC_BUDGET_MS` | `SOROBAN_RPC_MAX_RETRIES` |
+| Webhooks | `WEBHOOK_CALL_TIMEOUT_MS` | `WEBHOOK_CALL_BUDGET_MS` | `WEBHOOK_CALL_MAX_RETRIES` |
+
+### Impact on request and worker paths
+
+- **Request path.** API handlers that touch the database, Redis, or Soroban
+  RPC fail fast within the dependency budget and surface a timeout error
+  rather than holding the connection open. This bounds request latency and
+  prevents a single slow dependency from exhausting the request pool.
+- **Worker path.** The indexer poll loop and webhook delivery worker treat a
+  budget-exhausted call as a failed attempt: the poll is retried on the next
+  interval and webhook deliveries are retried within their own bounded budget.
+  A dependency outage therefore degrades throughput but never wedges the
+  worker.
+- **Observability.** Timeouts and budget exhaustion are logged with the
+  dependency name and attempt count, and counted in the indexer metrics so
+  on-call can distinguish a slow dependency from a hard outage.
+
+---
+
 ## 1. Poll ownership lease
 
 ### Behavior

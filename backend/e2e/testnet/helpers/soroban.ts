@@ -8,6 +8,7 @@ import {
   scValToNative,
   type xdr,
 } from '@stellar/stellar-sdk';
+import { createHash } from 'node:crypto';
 import { testnetConfig } from './config.js';
 
 export const server = new rpc.Server(testnetConfig.rpcUrl, {
