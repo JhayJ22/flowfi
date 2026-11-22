@@ -10,6 +10,14 @@ import { getApiBaseUrl } from "@/lib/api/_shared";
 import { logger } from "@/lib/logger";
 import { authenticatedFetch } from "@/lib/auth";
 import { useWallet } from "@/context/wallet-context";
+import {
+  registerTransaction,
+  updateTransactionStatus,
+  removeTransaction,
+  loadTransactions,
+  findDuplicate,
+  type TransactionCenterEntry,
+} from "@/lib/transaction-center";
 
 /**
  * TransactionTracker - Shared component for tracking on-chain transaction lifecycle
@@ -193,11 +201,11 @@ export default function TransactionTracker({
 
     case "pending":
       return (
-        <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+        <div className="financial-view rounded-xl border border-white/10 bg-white/5 p-4">
           <div className="flex items-center gap-3">
             <Loader2 className="h-5 w-5 animate-spin text-accent" />
             <div>
-              <p className="font-medium">Transaction Pending</p>
+              <p role="status" className="font-medium">Transaction Pending</p>
               <p className="text-sm text-slate-400">Preparing {ACTION_LABELS[action].present.toLowerCase()}...</p>
             </div>
           </div>
@@ -206,11 +214,11 @@ export default function TransactionTracker({
 
     case "simulating":
       return (
-        <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+        <div className="financial-view rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
           <div className="flex items-center gap-3">
             <Loader2 className="h-5 w-5 animate-spin text-blue-400" />
             <div>
-              <p className="font-medium text-blue-400">Simulating Transaction</p>
+              <p role="status" className="font-medium text-blue-400">Simulating Transaction</p>
               <p className="text-sm text-blue-400/70">Checking the contract call...</p>
             </div>
           </div>
@@ -220,14 +228,14 @@ export default function TransactionTracker({
     case "awaiting_approval":
     case "signing":
       return (
-        <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+        <div className="financial-view rounded-xl border border-white/10 bg-white/5 p-4">
           <div className="flex items-center gap-3">
             <div className="relative">
               <Loader2 className="h-5 w-5 animate-spin text-accent" />
               <div className="absolute inset-0 h-5 w-5 animate-ping rounded-full bg-accent/20" />
             </div>
             <div>
-              <p className="font-medium">Sign in Wallet</p>
+              <p role="status" className="font-medium">Sign in Wallet</p>
               <p className="text-sm text-slate-400">
                 {ACTION_LABELS[action].present} - confirm in your wallet
               </p>
@@ -246,11 +254,11 @@ export default function TransactionTracker({
 
     case "submitted":
       return (
-        <div className="rounded-xl border border-yellow-500/20 bg-yellow-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-yellow-500/20 bg-yellow-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <Loader2 className="h-5 w-5 animate-spin text-yellow-400" />
             <div>
-              <p className="font-medium text-yellow-400">Transaction Submitted</p>
+              <p role="status" className="font-medium text-yellow-400">Transaction Submitted</p>
               <p className="text-sm text-yellow-400/70">
                 Waiting for ledger inclusion...
               </p>
@@ -274,14 +282,14 @@ export default function TransactionTracker({
 
     case "confirming":
       return (
-        <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-blue-500/20 bg-blue-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <div className="relative">
               <Clock className="h-5 w-5 text-blue-400" />
               <Loader2 className="h-5 w-5 animate-spin absolute inset-0 text-blue-400" />
             </div>
             <div className="flex-1">
-              <p className="font-medium text-blue-400">Confirming on Indexer</p>
+              <p role="status" className="font-medium text-blue-400">Confirming on Indexer</p>
               <p className="text-sm text-blue-400/70">
                 Polling every 3s... (attempt {pollCount}/{MAX_POLL_ATTEMPTS})
               </p>
@@ -312,11 +320,11 @@ export default function TransactionTracker({
 
     case "confirmed":
       return (
-        <div className="rounded-xl border border-green-500/20 bg-green-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-green-500/20 bg-green-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <CheckCircle className="h-5 w-5 text-green-400" />
             <div>
-              <p className="font-medium text-green-400">
+              <p role="status" className="font-medium text-green-400">
                 {ACTION_LABELS[action].past} Successfully
               </p>
               <p className="text-sm text-green-400/70">
@@ -351,11 +359,11 @@ export default function TransactionTracker({
 
     case "timeout":
       return (
-        <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <Clock className="h-5 w-5 text-amber-400" />
             <div>
-              <p className="font-medium text-amber-400">Confirmation Timed Out</p>
+              <p role="status" className="font-medium text-amber-400">Confirmation Timed Out</p>
               <p className="text-sm text-amber-400/70">The transaction may still be indexing. Check its status before retrying.</p>
             </div>
           </div>
@@ -369,11 +377,11 @@ export default function TransactionTracker({
 
     case "failed":
       return (
-        <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4 space-y-3">
+        <div className="financial-view rounded-xl border border-red-500/20 bg-red-500/10 p-4 space-y-3">
           <div className="flex items-center gap-3">
             <XCircle className="h-5 w-5 text-red-400" />
             <div>
-              <p className="font-medium text-red-400">Transaction Failed</p>
+              <p role="status" className="font-medium text-red-400">Transaction Failed</p>
               <p className="text-sm text-red-400/70">
                 {ACTION_LABELS[action].present} failed
               </p>
@@ -412,11 +420,11 @@ export default function TransactionTracker({
 
     case "cancelled":
       return (
-        <div className="rounded-xl border border-slate-500/20 bg-slate-500/10 p-4">
+        <div className="financial-view rounded-xl border border-slate-500/20 bg-slate-500/10 p-4">
           <div className="flex items-center gap-3">
             <Ban className="h-5 w-5 text-slate-400" />
             <div>
-              <p className="font-medium text-slate-400">Action Cancelled</p>
+              <p role="status" className="font-medium text-slate-400">Action Cancelled</p>
               <p className="text-sm text-slate-400/70">
                 {ACTION_LABELS[action].present} was cancelled
               </p>
@@ -516,6 +524,7 @@ export function useTransactionTracker() {
   const [error, setError] = useState<string>();
   const [errorCode, setErrorCode] = useState<string>();
   const [ownerIdentity, setOwnerIdentity] = useState(identity);
+  const [centerEntry, setCenterEntry] = useState<TransactionCenterEntry | null>(null);
   const stateIsCurrent = ownerIdentity === identity;
 
   const reset = useCallback(() => {
@@ -524,6 +533,23 @@ export function useTransactionTracker() {
     setTxHash(undefined);
     setError(undefined);
     setErrorCode(undefined);
+    setCenterEntry(null);
+  }, [identity]);
+
+  // Rehydrate persisted entries on mount and resume polling for non-final states.
+  useEffect(() => {
+    if (!identity) return;
+    const entries = loadTransactions(identity);
+    const resumable = entries.find((entry) =>
+      ["submitted", "confirming", "user_action_required"].includes(entry.status)
+    );
+    if (!resumable) return;
+    setOwnerIdentity(identity);
+    setStatus(resumable.status as TransactionStatus);
+    setTxHash(resumable.txHash);
+    setError(resumable.error);
+    setErrorCode(resumable.errorCode);
+    setCenterEntry(resumable);
   }, [identity]);
 
   useEffect(() => {
@@ -538,6 +564,7 @@ export function useTransactionTracker() {
     setTxHash(undefined);
     setError(undefined);
     setErrorCode(undefined);
+    setCenterEntry(null);
   }, [identity]);
 
   const stage = useCallback((next: "simulating" | "awaiting_approval" | "submitted" | "confirming", hash?: string) => {
@@ -545,38 +572,110 @@ export function useTransactionTracker() {
     setStatus(next);
   }, []);
 
-  const submit = useCallback((hash: string) => {
-    setTxHash(hash);
-    setStatus("submitted");
-  }, []);
+  /**
+   * Register a submitted transaction with the transaction center.
+   * Returns false (and refuses to submit) when a matching pending entry exists,
+   * preventing duplicate submission.
+   */
+  const submit = useCallback(
+    (
+      hash: string,
+      meta?: { action?: TransactionAction; streamId?: string; idempotencyKey?: string }
+    ): boolean => {
+      if (!identity) return false;
+      const idempotencyKey = meta?.idempotencyKey ?? hash;
+      const duplicate = findDuplicate(identity, {
+        idempotencyKey,
+        txHash: hash,
+        action: meta?.action,
+        streamId: meta?.streamId,
+      });
+      if (duplicate) {
+        setCenterEntry(duplicate);
+        return false;
+      }
+      const entry = registerTransaction(identity, {
+        txHash: hash,
+        action: meta?.action,
+        streamId: meta?.streamId,
+        idempotencyKey,
+        status: "submitted",
+      });
+      setCenterEntry(entry);
+      setTxHash(hash);
+      setStatus("submitted");
+      return true;
+    },
+    [identity]
+  );
 
   const confirm = useCallback(() => {
     setStatus("confirming");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "confirming"));
+    }
+  }, [centerEntry]);
 
   const succeed = useCallback(() => {
     setStatus("confirmed");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "confirmed"));
+    }
+  }, [centerEntry]);
 
-  const fail = useCallback((err: string, code?: string) => {
-    setStatus("failed");
-    setError(err);
-    setErrorCode(code);
-  }, []);
+  const fail = useCallback(
+    (err: string, code?: string) => {
+      setStatus("failed");
+      setError(err);
+      setErrorCode(code);
+      if (centerEntry) {
+        setCenterEntry(updateTransactionStatus(centerEntry.id, "failed", { error: err, errorCode: code }));
+      }
+    },
+    [centerEntry]
+  );
+
+  const requireAction = useCallback(
+    (message: string) => {
+      setStatus("failed");
+      setError(message);
+      if (centerEntry) {
+        setCenterEntry(
+          updateTransactionStatus(centerEntry.id, "user_action_required", { error: message })
+        );
+      }
+    },
+    [centerEntry]
+  );
 
   const cancel = useCallback(() => {
     setStatus("cancelled");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "cancelled"));
+    }
+  }, [centerEntry]);
 
   const timeout = useCallback(() => {
     setStatus("timeout");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "user_action_required"));
+    }
+  }, [centerEntry]);
+
+  /** Dismiss a finalized entry from the transaction center. */
+  const dismiss = useCallback(() => {
+    if (centerEntry) {
+      removeTransaction(centerEntry.id);
+    }
+    reset();
+  }, [centerEntry, reset]);
 
   return {
     status: stateIsCurrent ? status : "idle",
     txHash: stateIsCurrent ? txHash : undefined,
     error: stateIsCurrent ? error : undefined,
     errorCode: stateIsCurrent ? errorCode : undefined,
+    centerEntry: stateIsCurrent ? centerEntry : null,
     reset,
     start,
     stage,
@@ -584,7 +683,9 @@ export function useTransactionTracker() {
     confirm,
     succeed,
     fail,
+    requireAction,
     cancel,
     timeout,
+    dismiss,
   };
 }
