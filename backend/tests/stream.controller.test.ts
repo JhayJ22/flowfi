@@ -3,6 +3,7 @@ import { createStream, listStreams, getStream, getStreamEvents, getStreamClaimab
 import { prisma } from '../src/lib/prisma.js';
 import { claimableAmountService } from '../src/services/claimable.service.js';
 import * as sorobanService from '../src/services/sorobanService.js';
+import * as paymentPolicyService from '../src/services/paymentPolicy.service.js';
 import type { Request, Response } from 'express';
 
 vi.mock('../src/lib/prisma.js', () => ({
@@ -35,6 +36,10 @@ vi.mock("../src/services/sorobanService.js", () => ({
   resumeStream: vi.fn(),
 }));
 
+vi.mock("../src/services/paymentPolicy.service.js", () => ({
+  evaluatePaymentPolicy: vi.fn(),
+}));
+
 vi.mock("../src/logger.js", () => ({
   default: {
     info: vi.fn(),
@@ -58,6 +63,16 @@ describe("Stream Controller", () => {
     vi.clearAllMocks();
     (sorobanService.isStale as any).mockReturnValue(false);
     (sorobanService.getStreamFromChain as any).mockResolvedValue(null);
+    // Default: policy allows the transaction (Issue #242).
+    (paymentPolicyService.evaluatePaymentPolicy as any).mockResolvedValue({
+      decision: 'allow',
+      reason: 'no_policy_configured',
+      policyId: null,
+      evaluatedAt: '2024-01-01T00:00:00.000Z',
+      durationMs: 1,
+      timedOut: false,
+      failOpen: false,
+    });
     req = {
       body: {
         streamId: "123",
@@ -217,6 +232,169 @@ describe("Stream Controller", () => {
           error: expect.objectContaining({ message: expect.stringContaining('depositedAmount') }),
         })
       );
+    });
+  });
+
+  describe('createStream payment policy boundary (Issue #242)', () => {
+    const confirmedStream = {
+      streamId: 123n,
+      sender: 'GSENDER',
+      recipient: 'GRECIPIENT',
+      tokenAddress: 'T1',
+      ratePerSecond: '10',
+      depositedAmount: '1000',
+      withdrawnAmount: '0',
+      startTime: 1622505600,
+      isActive: true,
+    };
+
+    it('evaluates the policy with deterministic inputs before preparing the stream', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue(null);
+      (sorobanService.getStreamFromChain as any).mockResolvedValue(confirmedStream);
+      (prisma.stream.upsert as any).mockResolvedValue({ streamId: 123 });
+
+      await createStream(req as Request, res as Response);
+
+      expect(paymentPolicyService.evaluatePaymentPolicy).toHaveBeenCalledTimes(1);
+      expect(paymentPolicyService.evaluatePaymentPolicy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'create_stream',
+          actor: 'GSENDER',
+          sender: 'GSENDER',
+          recipient: 'GRECIPIENT',
+          tokenAddress: 'T1',
+          streamId: '123',
+          ratePerSecond: '10',
+          depositedAmount: '1000',
+          startTime: '1622505600',
+        }),
+      );
+      expect(res.status).toHaveBeenCalledWith(201);
+    });
+
+    it('blocks stream preparation and returns 403 when the policy denies', async () => {
+      (paymentPolicyService.evaluatePaymentPolicy as any).mockResolvedValue({
+        decision: 'deny',
+        reason: 'recipient_not_allowed',
+        policyId: 'policy-1',
+        evaluatedAt: '2024-01-01T00:00:00.000Z',
+        durationMs: 2,
+        timedOut: false,
+        failOpen: false,
+      });
+
+      await createStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: expect.objectContaining({
+            code: 'PAYMENT_POLICY_DENIED',
+            reason: 'recipient_not_allowed',
+            policyId: 'policy-1',
+          }),
+        }),
+      );
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
+      expect(sorobanService.getStreamFromChain).not.toHaveBeenCalled();
+    });
+
+    it('fails closed (denies) when the policy evaluation times out by default', async () => {
+      (paymentPolicyService.evaluatePaymentPolicy as any).mockResolvedValue({
+        decision: 'deny',
+        reason: 'policy_timeout',
+        policyId: 'policy-1',
+        evaluatedAt: '2024-01-01T00:00:00.000Z',
+        durationMs: 500,
+        timedOut: true,
+        failOpen: false,
+      });
+
+      await createStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: expect.objectContaining({
+            code: 'PAYMENT_POLICY_DENIED',
+            reason: 'policy_timeout',
+          }),
+        }),
+      );
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
+    });
+
+    it('allows the stream when timeout occurs and fail-open is explicitly configured', async () => {
+      (paymentPolicyService.evaluatePaymentPolicy as any).mockResolvedValue({
+        decision: 'allow',
+        reason: 'policy_timeout_fail_open',
+        policyId: 'policy-1',
+        evaluatedAt: '2024-01-01T00:00:00.000Z',
+        durationMs: 500,
+        timedOut: true,
+        failOpen: true,
+      });
+      (prisma.stream.findUnique as any).mockResolvedValue(null);
+      (sorobanService.getStreamFromChain as any).mockResolvedValue(confirmedStream);
+      (prisma.stream.upsert as any).mockResolvedValue({ streamId: 123 });
+
+      await createStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(201);
+      expect(prisma.stream.upsert).toHaveBeenCalled();
+    });
+
+    it('fails closed when the policy service throws unexpectedly', async () => {
+      (paymentPolicyService.evaluatePaymentPolicy as any).mockRejectedValue(
+        new Error('policy engine unavailable'),
+      );
+
+      await createStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          error: expect.objectContaining({ code: 'PAYMENT_POLICY_DENIED' }),
+        }),
+      );
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
+    });
+
+    it('persists audit fields for the policy decision', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue(null);
+      (sorobanService.getStreamFromChain as any).mockResolvedValue(confirmedStream);
+      (prisma.stream.upsert as any).mockResolvedValue({ streamId: 123 });
+
+      await createStream(req as Request, res as Response);
+
+      const upsertArgs = (prisma.stream.upsert as any).mock.calls[0][0];
+      expect(upsertArgs.create.policyDecision).toBe('allow');
+      expect(upsertArgs.create.policyReason).toBe('no_policy_configured');
+      expect(upsertArgs.create.policyEvaluatedAt).toBe('2024-01-01T00:00:00.000Z');
+      expect(upsertArgs.create.policyDurationMs).toBe(1);
+      expect(upsertArgs.create.policyTimedOut).toBe(false);
+      expect(upsertArgs.create.policyFailOpen).toBe(false);
+    });
+
+    it('still enforces wallet authorization before policy evaluation', async () => {
+      (req as any).user = { publicKey: 'GATTACKER' };
+
+      await createStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(paymentPolicyService.evaluatePaymentPolicy).not.toHaveBeenCalled();
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
+    });
+
+    it('still enforces chain confirmation after the policy allows', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue(null);
+      (sorobanService.getStreamFromChain as any).mockResolvedValue(null);
+
+      await createStream(req as Request, res as Response);
+
+      expect(paymentPolicyService.evaluatePaymentPolicy).toHaveBeenCalledTimes(1);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
     });
   });
 
@@ -488,5 +666,164 @@ describe("Stream Controller", () => {
 
       expect(res.status).toHaveBeenCalledWith(200);
     });
+  });
+
+  // Issue #237: optimistic concurrency for stale stream mutations.
+  describe("stale mutation conflict contract (Issue #237)", () => {
+    const CURRENT_VERSION = 7;
+
+    type MutationCase = {
+      name: string;
+      handler: (req: Request, res: Response) => Promise<unknown>;
+      body: Record<string, unknown>;
+      stream: Record<string, unknown>;
+      mockSuccess: () => void;
+    };
+
+    const mutationCases: MutationCase[] = [
+      {
+        name: "cancel",
+        handler: cancelStream,
+        body: { secret: "S123" },
+        stream: { streamId: 123, sender: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.cancelStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "withdraw",
+        handler: withdrawStream,
+        body: { secret: "S123", amount: "100" },
+        stream: { streamId: 123, sender: "GUSER1", recipient: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.withdrawStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "top-up",
+        handler: topUpStream,
+        body: { secret: "S123", amount: "100" },
+        stream: { streamId: 123, sender: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.topUpStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "pause",
+        handler: pauseStream,
+        body: { secret: "S123" },
+        stream: { streamId: 123, sender: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.pauseStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "resume",
+        handler: resumeStream,
+        body: { secret: "S123" },
+        stream: {
+          streamId: 123,
+          sender: "GUSER1",
+          isActive: true,
+          isPaused: true,
+          pausedAt: Math.floor(Date.now() / 1000),
+        },
+        mockSuccess: () => {
+          (sorobanService.resumeStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+    ];
+
+    const expectedConflictPayload = (currentVersion: number) =>
+      expect.objectContaining({
+        error: expect.objectContaining({
+          code: "STREAM_VERSION_CONFLICT",
+          currentVersion,
+        }),
+      });
+
+    beforeEach(() => {
+      (req as any).user = { publicKey: "GUSER1" };
+    });
+
+    for (const mutation of mutationCases) {
+      describe(mutation.name, () => {
+        it("succeeds when the submitted version matches the current version", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body, version: CURRENT_VERSION };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+          (prisma.stream.update as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION + 1,
+          });
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(200);
+          expect(res.status).not.toHaveBeenCalledWith(409);
+        });
+
+        it("preserves legacy behavior when no version is submitted", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+          (prisma.stream.update as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION + 1,
+          });
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(200);
+          expect(res.status).not.toHaveBeenCalledWith(409);
+        });
+
+        it("returns 409 with current version metadata when the submitted version is stale", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body, version: CURRENT_VERSION - 1 };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(409);
+          expect(res.json).toHaveBeenCalledWith(expectedConflictPayload(CURRENT_VERSION));
+          expect(prisma.stream.update).not.toHaveBeenCalled();
+        });
+
+        it("returns the same 409 payload when the compare-and-set loses a concurrent update", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body, version: CURRENT_VERSION };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+          // Another request bumped the version between read and write.
+          (prisma.stream.update as any).mockRejectedValue(
+            Object.assign(new Error("Record to update not found."), { code: "P2025" }),
+          );
+          (prisma.stream.findUnique as any)
+            .mockResolvedValueOnce({ ...mutation.stream, version: CURRENT_VERSION })
+            .mockResolvedValueOnce({ ...mutation.stream, version: CURRENT_VERSION + 1 });
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(409);
+          expect(res.json).toHaveBeenCalledWith(expectedConflictPayload(CURRENT_VERSION + 1));
+        });
+      });
+    }
   });
 });
