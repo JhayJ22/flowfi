@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor, act } from "@testing-library/react";
+import { render, screen, waitFor, act, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import React from "react";
 
@@ -478,6 +478,25 @@ describe("StreamDetailsContent handlePause", () => {
     } as ReturnType<typeof origUseWallet>);
   });
 
+  it("keeps an offline pause unsigned until explicit review after reconnect", async () => {
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    try {
+      const { user } = await renderLoaded();
+      await user.click(screen.getByRole("button", { name: /^pause$/i }));
+      expect(screen.getByText(/pause prepared locally/i)).toBeInTheDocument();
+      online.mockReturnValue(true);
+      window.dispatchEvent(new Event("online"));
+      expect(mockSoroban.pauseStream).not.toHaveBeenCalled();
+      mockSoroban.pauseStream.mockResolvedValueOnce({ txHash: "reviewed" });
+      await user.click(screen.getByRole("button", { name: /review prepared pause/i }));
+      expect(mockSoroban.pauseStream).toHaveBeenCalledWith(mockSession, {
+        streamId: 42n, beforeSign: expect.any(Function),
+      });
+    } finally {
+      online.mockRestore();
+    }
+  });
+
   it("calls pauseStream and shows success toast on success", async () => {
     mockSoroban.pauseStream.mockResolvedValueOnce({ txHash: "tx_hash_3" });
     const { user } = await renderLoaded();
@@ -611,6 +630,16 @@ describe("StreamDetailsContent live-claimable interval", () => {
     global.fetch = createFetchMock();
   });
 
+  it("labels receipt funding as deposited and discloses a missing USD quote", async () => {
+    await renderLoaded({ depositedAmount: "10000000", withdrawnAmount: "0" });
+
+    const receipt = within(screen.getByRole("region", { name: "FlowFi payment receipt" }));
+    expect(receipt.getByText("Deposited")).toBeInTheDocument();
+    expect(receipt.getByText("1 XLM (USD unavailable)")).toBeInTheDocument();
+    expect(receipt.getByText("0 XLM (USD unavailable)")).toBeInTheDocument();
+    expect(receipt.queryByText("Total streamed")).not.toBeInTheDocument();
+  });
+
   it("shows live claimable indicator with a pulsing dot", async () => {
     const startTime = Math.floor(Date.now() / 1000) - 10;
     await renderLoaded({
@@ -622,7 +651,7 @@ describe("StreamDetailsContent live-claimable interval", () => {
     });
 
     // The live claimable section should have a pulsing dot indicator
-    const liveLabel = screen.getByText("Claimable");
+    const liveLabel = screen.getByText("Estimated claimable");
     expect(liveLabel).toBeInTheDocument();
 
     // The parent card should have the accent styling
@@ -641,7 +670,7 @@ describe("StreamDetailsContent live-claimable interval", () => {
     });
 
     // When paused, claimable should be deposited - withdrawn (no accrual)
-    expect(screen.getByText("Claimable")).toBeInTheDocument();
+    expect(screen.getByText("Estimated claimable")).toBeInTheDocument();
     // Status badge shows Paused
     expect(screen.getAllByText(/paused/i).length).toBeGreaterThan(0);
   });

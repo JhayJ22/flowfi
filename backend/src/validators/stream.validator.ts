@@ -35,6 +35,12 @@ export const createStreamSchema = z.object({
     ),
   depositedAmount: z.string().regex(/^\d+$/, 'Amount must be a positive integer as string'),
   startTime: z.union([z.number().int().nonnegative(), z.string().regex(/^\d+$/).transform(v => parseInt(v))]),
+  /**
+   * Optional customer-defined payment policy identifier. When provided, the
+   * server evaluates the referenced policy before preparing the transaction.
+   * Backward compatible: omitting it skips policy evaluation.
+   */
+  policyId: z.string().min(1, 'policyId must be a non-empty string').optional(),
 });
 
 export type CreateStreamInput = z.infer<typeof createStreamSchema>;
@@ -61,6 +67,73 @@ export const streamIdParamSchema = z.object({
 });
 
 export type StreamIdParamInput = z.infer<typeof streamIdParamSchema>;
+
+/**
+ * Shared schema for the optimistic-concurrency `expectedVersion` field.
+ *
+ * Clients may submit the stream state version they reviewed when preparing a
+ * mutation. The value is optional for backwards compatibility: when omitted,
+ * the mutation proceeds without a version check. When provided, it must be a
+ * non-negative integer (as a number or numeric string) and is normalized to a
+ * `number`.
+ */
+export const expectedVersionSchema = z
+  .union([z.number(), z.string()])
+  .optional()
+  .transform((v, ctx) => {
+    if (v === undefined || v === '') return undefined;
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isInteger(n) || n < 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'expectedVersion must be a non-negative integer',
+      });
+      return z.NEVER;
+    }
+    return n;
+  });
+
+export type ExpectedVersionInput = z.infer<typeof expectedVersionSchema>;
+
+/**
+ * Schema for stream mutation requests (cancel, withdraw, top-up, pause, resume).
+ * All mutations accept an optional `expectedVersion` for optimistic concurrency.
+ */
+export const streamMutationSchema = z.object({
+  expectedVersion: expectedVersionSchema,
+});
+
+export type StreamMutationInput = z.infer<typeof streamMutationSchema>;
+
+/**
+ * Schema for cancel-stream requests.
+ */
+export const cancelStreamSchema = streamMutationSchema;
+export type CancelStreamInput = z.infer<typeof cancelStreamSchema>;
+
+/**
+ * Schema for withdraw requests.
+ */
+export const withdrawStreamSchema = streamMutationSchema;
+export type WithdrawStreamInput = z.infer<typeof withdrawStreamSchema>;
+
+/**
+ * Schema for top-up requests.
+ */
+export const topUpStreamSchema = streamMutationSchema;
+export type TopUpStreamInput = z.infer<typeof topUpStreamSchema>;
+
+/**
+ * Schema for pause requests.
+ */
+export const pauseStreamSchema = streamMutationSchema;
+export type PauseStreamInput = z.infer<typeof pauseStreamSchema>;
+
+/**
+ * Schema for resume requests.
+ */
+export const resumeStreamSchema = streamMutationSchema;
+export type ResumeStreamInput = z.infer<typeof resumeStreamSchema>;
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 20;
@@ -126,3 +199,43 @@ export const streamHistoryQuerySchema = z.object({
 });
 
 export type StreamHistoryQueryInput = z.infer<typeof streamHistoryQuerySchema>;
+
+/**
+ * Schema for a payment policy evaluation request.
+ *
+ * This is a server-side business-rule boundary checked before a transaction
+ * is prepared. A successful evaluation is NOT on-chain authorization; wallet
+ * authorization and chain/network validation remain authoritative.
+ *
+ * Inputs:
+ * - actorWallet: the wallet performing the action (authorization subject).
+ * - walletAddress: the wallet address the transaction will be prepared for.
+ * - amount: the transaction amount as a positive integer string (base units).
+ * - tokenAddress: the token contract address involved.
+ * - recipient: the recipient address of the transaction.
+ * - network: the target chain/network identifier.
+ * - policyId: optional identifier of the customer-defined policy to evaluate.
+ */
+export const paymentPolicyEvaluationSchema = z.object({
+  actorWallet: z.string().min(1, 'actorWallet is required'),
+  walletAddress: z.string().min(1, 'walletAddress is required'),
+  amount: z
+    .string()
+    .regex(/^\d+$/, 'amount must be a positive integer as string')
+    .refine(
+      (val) => {
+        try {
+          return BigInt(val) <= MAX_I128;
+        } catch {
+          return true;
+        }
+      },
+      { message: 'amount exceeds maximum allowed value' },
+    ),
+  tokenAddress: z.string().min(1, 'tokenAddress is required'),
+  recipient: z.string().min(1, 'recipient is required'),
+  network: z.string().min(1, 'network is required'),
+  policyId: z.string().min(1, 'policyId must be a non-empty string').optional(),
+});
+
+export type PaymentPolicyEvaluationInput = z.infer<typeof paymentPolicyEvaluationSchema>;

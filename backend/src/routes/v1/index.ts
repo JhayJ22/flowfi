@@ -8,6 +8,7 @@ import userRoutes from './user.routes.js';
 import analyticsRoutes from './analytics.routes.js';
 import tokenRoutes from './token.routes.js';
 import adminRoutes from './admin.routes.js';
+import exportRoutes from './export.routes.js';
 
 const router = Router();
 
@@ -40,6 +41,11 @@ router.use('/analytics', analyticsRoutes);
 
 // Verified token metadata
 router.use('/tokens', tokenRoutes);
+
+// Exports — resumable async statement exports (activity / payments).
+// Ownership is enforced by the export router's auth middleware; do not
+// mount this before authentication is applied.
+router.use('/exports', exportRoutes);
 
 // Admin — indexer management, backfill, dead-letter (requires admin JWT)
 router.use('/admin', adminRoutes);
