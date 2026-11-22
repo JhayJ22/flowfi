@@ -6,6 +6,16 @@ on:
   push:
     branches: [main, master]
 
+env:
+  # Pinned contract build inputs so WASM artifacts and interface snapshots are
+  # reproducible across CI runs and local machines. Bump intentionally and
+  # regenerate snapshots (see contracts/README.md) when changing these.
+  RUST_TOOLCHAIN: "1.79.0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-C debuginfo=0 -C codegen-units=1"
+  SOURCE_DATE_EPOCH: "1700000000"
+
 jobs:
   changes:
     name: Detect changes
@@ -175,7 +185,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
 
