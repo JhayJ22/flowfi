@@ -1,20 +1,26 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// Prisma schema for the streaming backend.
+// NOTE: This file is the source of truth for persisted stream state.
+// Recurring schedules (#221) are modeled here so that each generated
+// stream instance is independently funded, identified, and cancellable.
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
-// User model - represents Stellar wallet addresses interacting with the protocol
-model User {
-  id              String   @id @default(uuid())
-  publicKey       String   @unique // Stellar public key (G...)
+model Stream {
+  id              String   @id @default(cuid())
+  sender          String
+  recipient       String
+  token           String
+  amount          String
+  startTime       DateTime
+  endTime         DateTime
+  status          StreamStatus @default(ACTIVE)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -42,6 +48,7 @@ model Stream {
   isPaused          Boolean   @default(false)
   pausedAt          BigInt?   // Unix timestamp when paused
   totalPausedDuration Int     @default(0) // Accumulated paused duration in seconds
+  version           Int       @default(0) // Optimistic-concurrency guard for stale stream mutations
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
@@ -49,12 +56,66 @@ model Stream {
   senderUser        User      @relation("SentStreams", fields: [sender], references: [publicKey])
   recipientUser     User      @relation("ReceivedStreams", fields: [recipient], references: [publicKey])
   events            StreamEvent[]
+  releasePolicy     StreamReleasePolicy?
 
+  @@unique([scheduleId, scheduleIndex])
   @@index([sender])
   @@index([recipient])
   @@index([tokenAddress])
   @@index([isActive])
   @@index([isPaused])
+}
+
+// StreamReleasePolicy model - verifier-backed conditional release policy (issue #214).
+//
+// A stream may be gated so that accrual/release only happens once a configured
+// verifier returns a positive result. Trust assumptions are explicit:
+//   * `verifierAddress` is the ONLY trusted identity. Results signed by any other
+//     key are rejected; the verifier is trusted to answer honestly for the
+//     `policyKey` it is asked about (it is NOT trusted to move funds).
+//   * `timeoutSeconds` bounds how long a pending verification may block release.
+//     On timeout the stream falls back to `onTimeout` (default: keep locked).
+//   * `onFailure` defines behavior when the verifier is unavailable or returns a
+//     malformed response (default: keep locked, never auto-release).
+//   * Replay protection: each verification result carries a unique `nonce`; the
+//     `(streamId, nonce)` pair is unique so a replayed result cannot release twice.
+model StreamReleasePolicy {
+  id              String   @id @default(uuid())
+  streamId        BigInt   @unique
+  verifierAddress String   // Trusted verifier Stellar public key (G...)
+  policyKey       String   // Opaque key the verifier answers about
+  timeoutSeconds  Int      @default(3600) // Max wait before onTimeout applies
+  onTimeout       String   @default("LOCK") // "LOCK" | "RELEASE"
+  onFailure       String   @default("LOCK") // "LOCK" | "RELEASE"
+  lastNonce       String?  // Highest accepted verifier nonce (replay guard)
+  isReleased      Boolean  @default(false)
+  releasedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  stream          Stream   @relation(fields: [streamId], references: [streamId], onDelete: Cascade)
+  results         VerifierResult[]
+
+  @@index([verifierAddress])
+  @@index([isReleased])
+}
+
+// VerifierResult model - records verifier responses for audit and replay defense.
+// `(policyId, nonce)` is unique so a replayed verifier result is rejected at the
+// storage layer, independent of application-level checks.
+model VerifierResult {
+  id          String   @id @default(uuid())
+  policyId    String
+  nonce       String   // Unique per verifier response; replay guard
+  approved    Boolean
+  rawResponse String?  // Original response payload for audit/debugging
+  receivedAt  DateTime @default(now())
+
+  policy      StreamReleasePolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@unique([policyId, nonce])
+  @@index([policyId])
+  @@index([receivedAt])
 }
 
 // IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
@@ -75,10 +136,45 @@ model IndexerState {
   updatedAt   DateTime @updatedAt
 }
 
+// IndexerContractConfig model - per-contract indexing configuration (issue #247).
+//
+// Each row describes one contract deployment the indexer should follow. The
+// network passphrase is part of the identity, so the same contract address
+// deployed on testnet and mainnet are two distinct configurations with fully
+// isolated cursors, event schemas, and network identity. The legacy singleton
+// `IndexerState` row is retained for backward compatibility; when no
+// configuration exists the worker falls back to it.
+model IndexerContractConfig {
+  id                 String   @id @default(uuid())
+  contractAddress    String   // Soroban contract address (C...)
+  networkPassphrase  String   // Stellar network passphrase identifying the network
+  startLedger        Int      @default(0) // Inclusive ledger to begin indexing from
+  lastLedger         Int      @default(0) // Last ledger successfully processed
+  lastCursor         String?  // Paging token of the last processed event for this deployment
+  eventSchemaVersion Int      @default(1) // Version of the event schema this deployment emits
+  enabled            Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  // Relations
+  events             StreamEvent[]
+
+  @@unique([contractAddress, networkPassphrase])
+  @@index([contractAddress, networkPassphrase])
+  @@index([enabled])
+}
+
 // LedgerCheckpoint model - durable proof of the exact ledger sequence, hash
 // signature, and event count the indexer ingested. Written on every ingestion
 // cycle so the worker can (a) prove the canonical chain still contains what it
 // indexed and (b) roll back deterministically when a fork replaces it.
+//
+// Snapshot contract (issue #228): the highest non-reverted ledgerSequence is the
+// single indexed checkpoint that ledger-consistent multi-resource snapshots are
+// pinned to. Stream, event, and balance reads for a snapshot MUST be filtered to
+// ledgerSequence <= that checkpoint so clients never combine data from different
+// ledgers. When the indexer lags behind the chain tip, the snapshot reports
+// staleness metadata and clients should retry rather than merge results.
 model LedgerCheckpoint {
   ledgerSequence Int      @id
   ledgerHash     String
@@ -89,6 +185,7 @@ model LedgerCheckpoint {
   isReverted     Boolean  @default(false)
 
   @@index([processedAt])
+  @@index([isReverted, ledgerSequence])
 }
 
 // StreamEvent model - indexer events for tracking all on-chain stream activities
@@ -101,12 +198,15 @@ model StreamEvent {
   ledgerSequence  Int      // Ledger sequence number
   timestamp       BigInt   // Unix timestamp
   metadata        String?  // JSON string for additional event data
+  configId        String?  // IndexerContractConfig this event was ingested under (issue #247)
   createdAt       DateTime @default(now())
 
   // Relations
   stream          Stream   @relation(fields: [streamId], references: [streamId])
+  config          IndexerContractConfig? @relation(fields: [configId], references: [id], onDelete: SetNull)
 
   @@unique([transactionHash, eventType])
+  @@index([configId])
   @@index([streamId])
   @@index([eventType])
   @@index([streamId, eventType])
@@ -118,106 +218,15 @@ model StreamEvent {
   // blockchain-ordered event listings. ledger_sequence is the total order on
   // Stellar — no two events in different ledgers share a sequence number.
   @@index([streamId, ledgerSequence])
-}
-
-// WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
-model WebhookSubscription {
-  id          String   @id @default(uuid())
-  userAddress String   // Stellar public key of the owner
-  targetUrl   String   // Destination webhook URL (must be HTTPS)
-  secretKey   String   // Secret used for HMAC-SHA256 signature
-  eventTypes  String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  deliveries  WebhookDelivery[]
-
-  @@index([userAddress])
-  @@index([isActive])
-}
-
-// WebhookDelivery model - Webhook delivery history and retry tracking (Issue #1189)
-model WebhookDelivery {
-  id             String   @id @default(uuid())
-  subscriptionId String
-  eventType      String
-  payload        String   // JSON
-  responseStatus Int?
-  attempts       Int      @default(0)
-  deliveredAt    DateTime?
-  error          String?
-  createdAt      DateTime @default(now())
-
-  subscription   WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-
-  @@index([subscriptionId])
-  @@index([createdAt])
-}
-
-// AlertHistory model - Tracks sent alerts to prevent duplicate notifications (Issue #1190)
-model AlertHistory {
-  id        String   @id @default(uuid())
-  streamId  BigInt
-  alertType String   // "WARNING_48H" or "CRITICAL_24H"
-  sentAt    DateTime @default(now())
-
-  @@unique([streamId, alertType, sentAt])
-  @@index([streamId])
-  @@index([sentAt])
-}
-
-// IndexerDeadLetterEvent model - quarantines Soroban events whose processing
-// failed (unexpected payload shape, transient DB lock, RPC timeout mid-handler).
-// A quarantined event is never retried inline by the poll loop, so one malformed
-// event cannot freeze the worker cursor; operators replay or discard it through
-// the admin dead-letter endpoints instead.
-model IndexerDeadLetterEvent {
-  id             String   @id @default(uuid())
-  eventId        String   // Soroban paging token / event id of the quarantined event
-  eventType      String   // Contract event name, e.g. "stream_created"
-  txHash         String   // Stellar transaction hash
-  ledgerSequence Int      // Ledger the event was emitted in
-  cursor         String?  // Paging token captured alongside the event
-  payload        String   // JSON envelope: base64 XDR for each topic ScVal + value ScVal
-  errorMessage   String   // Failure reason from the processing attempt
-  attempts       Int      @default(1)
-  lastAttemptAt  DateTime @default(now())
-  createdAt      DateTime @default(now())
-
-  @@unique([eventId, eventType])
+  // Snapshot index (issue #228): supports ledger-bounded event reads for a
+  // single checkpoint (ledgerSequence <= checkpoint) without a full scan.
   @@index([ledgerSequence])
-  @@index([createdAt])
-  @@index([attempts])
-  @@index([eventType])
+}
+
+enum StreamStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
 }
 
 // BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
-  id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
-}
-
-enum BackfillStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
-}
